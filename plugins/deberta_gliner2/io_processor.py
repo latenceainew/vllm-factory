@@ -24,6 +24,8 @@ Request format (offline):
 
 from __future__ import annotations
 
+import logging
+import time
 from collections import OrderedDict
 from collections.abc import Sequence
 from dataclasses import dataclass, field
@@ -41,6 +43,8 @@ from plugins.deberta_gliner2.processor import (
     preprocess,
 )
 from vllm_factory.io.base import FactoryIOProcessor, PoolingRequestOutput, PromptType, TokensPrompt
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -66,6 +70,71 @@ class DeBERTaGLiNER2IOProcessor(FactoryIOProcessor):
     """
 
     pooling_task = "plugin"
+
+    @staticmethod
+    def _text_length_bucket(token_count: int) -> str:
+        if token_count <= 32:
+            return "0_32"
+        if token_count <= 128:
+            return "33_128"
+        if token_count <= 512:
+            return "129_512"
+        return "513_plus"
+
+    @staticmethod
+    def _task_shape(task_types: Sequence[str]) -> str:
+        return ",".join(task_types) if task_types else "none"
+
+    def _log_observability(self, request_meta: Dict[str, Any] | None) -> None:
+        if not request_meta or not logger.isEnabledFor(logging.INFO):
+            return
+
+        try:
+            obs = request_meta.get("_observability")
+            if not isinstance(obs, dict):
+                return
+
+            request_started_at = obs.get("request_started_at")
+            preprocess_elapsed_ms = obs.get("preprocess_elapsed_ms")
+            schema_cache_hit = obs.get("schema_cache_hit")
+            schema_count = obs.get("schema_count")
+            text_token_count = obs.get("text_token_count")
+            text_length_bucket = obs.get("text_length_bucket")
+            task_types = obs.get("task_types")
+            request_id = obs.get("request_id", "_unknown")
+
+            if not isinstance(request_started_at, (int, float)):
+                return
+            if not isinstance(preprocess_elapsed_ms, (int, float)):
+                return
+            if not isinstance(schema_count, int):
+                return
+            if not isinstance(text_token_count, int):
+                return
+            if not isinstance(text_length_bucket, str):
+                return
+            if not isinstance(task_types, str):
+                return
+
+            total_elapsed_ms = (time.perf_counter() - request_started_at) * 1000.0
+            logger.info(
+                "GLiNER2 request complete request_id=%s preprocess_ms=%.3f total_ms=%.3f "
+                "schema_cache_hit=%s schema_count=%d text_token_count=%d text_length_bucket=%s "
+                "task_types=%s",
+                request_id,
+                preprocess_elapsed_ms,
+                total_elapsed_ms,
+                schema_cache_hit,
+                schema_count,
+                text_token_count,
+                text_length_bucket,
+                task_types,
+            )
+        except Exception:
+            try:
+                logger.exception("GLiNER2 observability logging failed")
+            except Exception:
+                return
 
     def __init__(self, vllm_config: VllmConfig, *args, **kwargs):
         super().__init__(vllm_config, *args, **kwargs)
@@ -144,6 +213,7 @@ class DeBERTaGLiNER2IOProcessor(FactoryIOProcessor):
         parsed_input: GLiNER2Input,
         request_id: str | None,
     ) -> PromptType | Sequence[PromptType]:
+        request_started_at = time.perf_counter()
         result = preprocess(
             self._tokenizer,
             parsed_input.text,
@@ -154,6 +224,7 @@ class DeBERTaGLiNER2IOProcessor(FactoryIOProcessor):
             tokenization_cache=self._tokenization_cache,
             schema_cache=self._schema_preprocess_cache,
         )
+        preprocess_elapsed_ms = (time.perf_counter() - request_started_at) * 1000.0
 
         ids_list = result["input_ids"]
 
@@ -183,6 +254,16 @@ class DeBERTaGLiNER2IOProcessor(FactoryIOProcessor):
             "threshold": parsed_input.threshold,
             "include_confidence": parsed_input.include_confidence,
             "include_spans": parsed_input.include_spans,
+            "_observability": {
+                "request_id": request_id or "_offline",
+                "request_started_at": request_started_at,
+                "preprocess_elapsed_ms": preprocess_elapsed_ms,
+                "schema_cache_hit": result["schema_cache_hit"],
+                "schema_count": result["schema_count"],
+                "text_token_count": len(result["text_tokens"]),
+                "text_length_bucket": self._text_length_bucket(len(result["text_tokens"])),
+                "task_types": self._task_shape(result["task_types"]),
+            },
         }
 
         self._stash(extra_kwargs=gliner_data, request_id=request_id, meta=postprocess_meta)
@@ -194,26 +275,29 @@ class DeBERTaGLiNER2IOProcessor(FactoryIOProcessor):
         model_output: Sequence[PoolingRequestOutput],
         request_meta: Any,
     ) -> Dict:
-        if not model_output or request_meta is None:
-            return {}
+        try:
+            if not model_output or request_meta is None:
+                return {}
 
-        output = model_output[0]
-        raw = output.outputs.data
-        if raw is None:
-            return {}
+            output = model_output[0]
+            raw = output.outputs.data
+            if raw is None:
+                return {}
 
-        results = decode_output(
-            raw,
-            schema=request_meta["schema_dict"],
-            task_types=request_meta["task_types"],
-        )
+            results = decode_output(
+                raw,
+                schema=request_meta["schema_dict"],
+                task_types=request_meta["task_types"],
+            )
 
-        return format_results(
-            results,
-            threshold=request_meta.get("threshold", 0.5),
-            include_confidence=request_meta.get("include_confidence", False),
-            include_spans=request_meta.get("include_spans", False),
-        )
+            return format_results(
+                results,
+                threshold=request_meta.get("threshold", 0.5),
+                include_confidence=request_meta.get("include_confidence", False),
+                include_spans=request_meta.get("include_spans", False),
+            )
+        finally:
+            self._log_observability(request_meta)
 
 
 def get_processor_cls() -> str:
