@@ -513,6 +513,7 @@ def preprocess_schema(
         cached = copy.deepcopy(schema_cache[cache_key])
         if hasattr(schema_cache, "move_to_end"):
             schema_cache.move_to_end(cache_key)
+        cached["schema_cache_hit"] = True
         return cached
 
     processed = infer_schemas_from_dict(schema)
@@ -523,6 +524,7 @@ def preprocess_schema(
         "schema_tokens_list": schema_tokens_list,
         "task_types": task_types,
         "schema_count": len(schema_tokens_list),
+        "schema_cache_hit": False,
     }
     if schema_cache is not None:
         schema_cache[cache_key] = copy.deepcopy(result)
@@ -530,7 +532,7 @@ def preprocess_schema(
             schema_cache.move_to_end(cache_key)
             while len(schema_cache) > 256:
                 schema_cache.popitem(last=False)
-    return copy.deepcopy(result)
+    return result
 
 
 # ==================================================================
@@ -557,10 +559,6 @@ def preprocess(
         text = text + "."
     elif not text:
         text = "."
-
-    schema_cache_hit = False
-    if schema_cache is not None:
-        schema_cache_hit = get_schema_cache_key(schema) in schema_cache
 
     schema_state = preprocess_schema(
         schema,
@@ -599,7 +597,7 @@ def preprocess(
         "task_types": schema_state["task_types"],
         "text_tokens": text_tokens,
         "schema_count": schema_state["schema_count"],
-        "schema_cache_hit": schema_cache_hit,
+        "schema_cache_hit": schema_state["schema_cache_hit"],
         "original_text": text,
         "start_mapping": start_mapping,
         "end_mapping": end_mapping,
