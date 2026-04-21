@@ -18,6 +18,28 @@ Request format (online POST /pooling):
               "include_spans": false},
      "model": "...", "task": "plugin"}
 
+Schema shapes (all optional per-field thresholds fall back to request-level
+``threshold`` when omitted):
+
+    entities — list or dict:
+        ["person", "org"]
+        {"person": "Description", "org": ""}
+        {"person": {"description": "People", "threshold": 0.9}}
+
+    classifications — list of dicts:
+        [{"task": "sentiment", "labels": ["pos", "neg"],
+          "multi_label": false, "cls_threshold": 0.6}]
+
+    relations — list or dict:
+        ["works_at", "reports_to"]
+        {"works_at": {"description": "Employment", "threshold": 0.25}}
+
+    structures — dict of structure definitions:
+        {"invoice": {"fields": [
+            {"name": "date", "dtype": "str", "threshold": 0.8},
+            {"name": "memo", "threshold": 0.2}
+        ]}}
+
 Request format (offline):
     llm.encode({"data": {"text": "...", "schema": {...}}})
 """
@@ -241,6 +263,7 @@ class DeBERTaGLiNER2IOProcessor(FactoryIOProcessor):
             "start_mapping": result["start_mapping"],
             "end_mapping": result["end_mapping"],
             "threshold": parsed_input.threshold,
+            "threshold_meta": result.get("threshold_meta"),
         }
 
         postprocess_meta = {

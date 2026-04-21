@@ -55,6 +55,36 @@ Mixed schema payload:
 }
 ```
 
+Per-field threshold payload (all thresholds optional, fall back to request-level `threshold`):
+
+```json
+{
+  "data": {
+    "text": "John Smith works at NVIDIA in Santa Clara. His email is john@nvidia.com.",
+    "schema": {
+      "entities": {
+        "person": {"description": "Person names", "threshold": 0.3},
+        "email": {"threshold": 0.9}
+      },
+      "classifications": [
+        {"task": "topic", "labels": ["tech", "finance"], "cls_threshold": 0.6}
+      ],
+      "relations": {
+        "works_at": {"description": "Employment", "threshold": 0.25}
+      },
+      "structures": {
+        "employee": {"fields": [
+          {"name": "name", "dtype": "str", "threshold": 0.8},
+          {"name": "title", "threshold": 0.2}
+        ]}
+      }
+    },
+    "threshold": 0.5,
+    "include_confidence": true
+  }
+}
+```
+
 Response notes:
 
 - `entities` returns per-label lists.
