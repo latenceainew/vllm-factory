@@ -15,6 +15,14 @@ import pytest
 
 pytest.importorskip("vllm", reason="SupportsLoRA tests require vLLM")
 
+try:
+    from vllm.model_executor.models.interfaces import supports_lora  # noqa: F401
+except Exception as exc:  # pragma: no cover - environment-dependent
+    pytest.skip(
+        f"vLLM importable but interfaces unavailable ({exc!r})",
+        allow_module_level=True,
+    )
+
 
 def test_gliner2_plugin_model_satisfies_supports_lora_protocol():
     from vllm.model_executor.models.interfaces import supports_lora
