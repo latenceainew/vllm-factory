@@ -94,6 +94,23 @@ def phase_prepare():
     print("\n--- JSON Results ---")
     print(json.dumps(json_result, indent=2, default=str))
 
+    # Per-entity threshold reference — person at 0.9 should return fewer results
+    # than the default 0.5 threshold
+    from gliner2 import Schema
+
+    per_threshold_schema = Schema().entities({"person": {"threshold": 0.9}, "email": {}})
+    per_threshold_result = model.batch_extract(
+        [TEXT],
+        per_threshold_schema,
+        threshold=THRESHOLD,
+        include_confidence=True,
+        include_spans=True,
+    )
+    per_threshold_entities = per_threshold_result[0].get("entities", {}) if per_threshold_result else {}
+
+    print("\n--- Per-Entity Threshold Results ---")
+    print(json.dumps(per_threshold_entities, indent=2, default=str))
+
     # Save references
     refs = {
         "model": MODEL,
@@ -102,6 +119,7 @@ def phase_prepare():
         "classification": classification,
         "relations": relations,
         "json_structure": json_result,
+        "per_threshold_entities": per_threshold_entities,
     }
     with open(REF_FILE, "w") as f:
         json.dump(refs, f, indent=2, default=str)
@@ -420,14 +438,72 @@ def phase_test():
     )
     print(f"vLLM: {json.dumps(mixed_formatted, indent=2, default=str)}")
 
+    # ──────────────────────────────────────────────────────────────
+    # Per-entity threshold parity
+    # ──────────────────────────────────────────────────────────────
+    print("\n" + "=" * 60)
+    print("Per-entity threshold parity")
+    print("=" * 60)
+
+    ref_per_threshold = refs.get("per_threshold_entities", {})
+    if ref_per_threshold:
+        per_t_schema = normalize_gliner2_schema({
+            "entities": {
+                "person": {"threshold": 0.9},
+                "email": {},
+            }
+        })
+        per_t_pp = PoolingParams(
+            additional_data=json.dumps({
+                "schema": {
+                    "entities": {
+                        "person": {"threshold": 0.9},
+                        "email": {},
+                    }
+                },
+                "threshold": THRESHOLD,
+                "include_confidence": True,
+                "include_spans": True,
+            })
+        )
+        per_t_out = llm.encode(
+            TokensPrompt(prompt_token_ids=preprocess(
+                tokenizer, TEXT, per_t_schema,
+            )["input_ids"]),
+            pooling_params=per_t_pp,
+            pooling_task="plugin",
+        )
+        per_t_result = decode_output(per_t_out[0].outputs.data, per_t_schema)
+        per_t_formatted = format_results(
+            per_t_result,
+            threshold=THRESHOLD,
+            include_confidence=True,
+            include_spans=True,
+        )
+
+        per_t_entities = per_t_formatted.get("entities", {})
+        print(f"Reference (native):  {json.dumps(ref_per_threshold, indent=2, default=str)}")
+        print(f"vLLM per-threshold:  {json.dumps(per_t_entities, indent=2, default=str)}")
+
+        # Verify that high threshold for person reduces results vs default
+        default_person_count = len(refs.get("entities", {}).get("person", []))
+        per_t_person_count = len(per_t_entities.get("person", []))
+        threshold_effective = per_t_person_count <= default_person_count
+        print(f"Person count default={default_person_count} vs per-threshold={per_t_person_count}: "
+              f"{'✅' if threshold_effective else '⚠️'}")
+    else:
+        print("⚠️  No per-threshold reference found — skipping")
+        threshold_effective = True
+
     # Final summary
     print("\n" + "=" * 60)
     print("SUMMARY")
     print("=" * 60)
-    print(f"Entity F1:      {f1:.4f}")
-    print(f"Classification: {'✅' if cls_match else '❌'}")
-    print(f"Latency:        {latency:.1f}ms")
-    status = "✅ PARITY OK" if f1 >= 0.8 and cls_match else "⚠️  NEEDS WORK"
+    print(f"Entity F1:         {f1:.4f}")
+    print(f"Classification:    {'✅' if cls_match else '❌'}")
+    print(f"Per-threshold:     {'✅' if threshold_effective else '⚠️'}")
+    print(f"Latency:           {latency:.1f}ms")
+    status = "✅ PARITY OK" if f1 >= 0.8 and cls_match and threshold_effective else "⚠️  NEEDS WORK"
     print(status)
 
 
