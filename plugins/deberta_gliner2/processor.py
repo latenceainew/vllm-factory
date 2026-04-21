@@ -62,6 +62,18 @@ SPECIAL_TOKENS = [
 ]
 
 
+def _validate_threshold(value: Any, label: str) -> float | None:
+    if value is None:
+        return None
+    try:
+        value = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"Threshold for '{label}' must be a number") from exc
+    if not 0.0 <= value <= 1.0:
+        raise ValueError(f"Threshold for '{label}' must be between 0 and 1, got {value}")
+    return value
+
+
 def _empty_schema() -> dict[str, Any]:
     return {
         "json_structures": [],
@@ -71,6 +83,8 @@ def _empty_schema() -> dict[str, Any]:
         "_meta": {
             "json_structures": {},
             "relations": {},
+            "entities": {},
+            "classifications": {},
         },
     }
 
@@ -116,13 +130,38 @@ def get_schema_cache_key(schema: dict[str, Any]) -> str:
 # ==================================================================
 
 
-def normalize_entities_schema(entities: Any) -> OrderedDict[str, str]:
+def normalize_entities_schema(
+    entities: Any,
+) -> OrderedDict[str, str] | tuple[OrderedDict[str, str], dict[str, dict[str, Any]]]:
+    """Normalize entities to OrderedDict[name, description].
+
+    Returns:
+        If no entity carries a threshold: ``OrderedDict[name, description]`` (backward compat).
+        If any entity carries a threshold: ``(OrderedDict[name, description], entity_meta)``
+        where ``entity_meta = {name: {"threshold": float|None}}``.
+    """
     if entities is None:
         return OrderedDict()
     if isinstance(entities, list):
         return OrderedDict((str(label), "") for label in entities)
     if isinstance(entities, dict):
-        return OrderedDict((str(label), str(desc or "")) for label, desc in entities.items())
+        ordered = OrderedDict()
+        entity_meta: dict[str, dict[str, Any]] = {}
+        has_meta = False
+        for label, value in entities.items():
+            name = str(label)
+            if isinstance(value, dict):
+                ordered[name] = str(value.get("description") or "")
+                threshold = _validate_threshold(value.get("threshold"), name)
+                entity_meta[name] = {"threshold": threshold}
+                if threshold is not None:
+                    has_meta = True
+            else:
+                ordered[name] = str(value or "")
+                entity_meta[name] = {"threshold": None}
+        if has_meta:
+            return ordered, entity_meta
+        return ordered
     raise ValueError("'entities' must be a list or dict")
 
 
@@ -152,22 +191,34 @@ def normalize_classifications_schema(classifications: Any) -> list[dict[str, Any
             config["label_descriptions"] = {
                 str(label): str(desc or "") for label, desc in config["label_descriptions"].items()
             }
+        if "cls_threshold" in config:
+            config["cls_threshold"] = _validate_threshold(
+                config["cls_threshold"], f"classification '{task}'"
+            )
         normalized.append(config)
     return normalized
 
 
 def normalize_relations_schema(
     relations: Any,
-) -> tuple[list[dict[str, dict[str, str]]], dict[str, str]]:
+) -> tuple[list[dict[str, dict[str, str]]], dict[str, dict[str, Any]]]:
     if relations is None:
         return [], {}
     if isinstance(relations, list):
         return [{str(name): {"head": "", "tail": ""}} for name in relations], {}
     if isinstance(relations, dict):
-        return (
-            [{str(name): {"head": "", "tail": ""}} for name in relations],
-            {str(name): str(desc or "") for name, desc in relations.items()},
-        )
+        structured = []
+        meta: dict[str, dict[str, Any]] = {}
+        for name, value in relations.items():
+            sname = str(name)
+            structured.append({sname: {"head": "", "tail": ""}})
+            if isinstance(value, dict):
+                desc = str(value.get("description") or "")
+                threshold = _validate_threshold(value.get("threshold"), sname)
+                meta[sname] = {"description": desc, "threshold": threshold}
+            else:
+                meta[sname] = {"description": str(value or ""), "threshold": None}
+        return structured, meta
     raise ValueError("'relations' must be a list or dict")
 
 
@@ -197,12 +248,16 @@ def normalize_structures_schema(
                 raise ValueError(f"Structure '{parent}' field is missing name")
             name = str(name)
             normalized_fields[name] = ""
+            threshold = _validate_threshold(
+                field.get("threshold"), f"structure '{parent}' field '{name}'"
+            )
             field_meta.append(
                 {
                     "name": name,
                     "dtype": str(field.get("dtype") or ""),
                     "description": str(field.get("description") or ""),
                     "choices": [str(choice) for choice in field.get("choices", [])],
+                    "threshold": threshold,
                 }
             )
 
@@ -218,8 +273,24 @@ def normalize_gliner2_schema(schema: dict[str, Any]) -> dict[str, Any]:
         raise ValueError("'schema' must be a dict")
 
     normalized = _empty_schema()
-    normalized["entities"] = normalize_entities_schema(schema.get("entities"))
+
+    entities_result = normalize_entities_schema(schema.get("entities"))
+    if isinstance(entities_result, tuple):
+        normalized["entities"], entity_meta = entities_result
+    else:
+        normalized["entities"] = entities_result
+        entity_meta = {str(name): {"threshold": None} for name in normalized["entities"]}
+    normalized["_meta"]["entities"] = entity_meta
+
     normalized["classifications"] = normalize_classifications_schema(schema.get("classifications"))
+    cls_meta: dict[str, dict[str, Any]] = {}
+    for cls_config in normalized["classifications"]:
+        task = cls_config["task"]
+        cls_meta[task] = {
+            "cls_threshold": cls_config.get("cls_threshold"),
+            "multi_label": bool(cls_config.get("multi_label", False)),
+        }
+    normalized["_meta"]["classifications"] = cls_meta
 
     relations, relation_meta = normalize_relations_schema(schema.get("relations"))
     normalized["relations"] = relations
@@ -536,6 +607,40 @@ def preprocess_schema(
 
 
 # ==================================================================
+# Threshold Meta
+# ==================================================================
+
+
+def _build_threshold_meta(meta: dict[str, Any]) -> dict[str, Any]:
+    """Extract per-field thresholds from _meta into pooler-ready shape.
+
+    Returns None-filled dicts when no per-field thresholds are set, so the
+    pooler can unconditionally fall back to the global threshold.
+    """
+    entities_meta = meta.get("entities", {})
+    structures_meta = meta.get("json_structures", {})
+    relations_meta = meta.get("relations", {})
+
+    return {
+        "entities": {
+            name: m.get("threshold") if isinstance(m, dict) else None
+            for name, m in entities_meta.items()
+        },
+        "json_structures": {
+            parent: [
+                f.get("threshold") if isinstance(f, dict) else None
+                for f in fields
+            ]
+            for parent, fields in structures_meta.items()
+        },
+        "relations": {
+            name: m.get("threshold") if isinstance(m, dict) else None
+            for name, m in relations_meta.items()
+        },
+    }
+
+
+# ==================================================================
 # Main Preprocessing
 # ==================================================================
 
@@ -590,6 +695,9 @@ def preprocess(
         tokenization_cache,
     )
 
+    meta = schema.get("_meta", {})
+    threshold_meta = _build_threshold_meta(meta)
+
     return {
         "input_ids": fmt["input_ids"],
         "mapped_indices": fmt["mapped_indices"],
@@ -604,6 +712,7 @@ def preprocess(
         "special_token_ids": special_token_ids or build_special_token_ids(tokenizer),
         "token_pooling": token_pooling,
         "schema_dict": schema,
+        "threshold_meta": threshold_meta,
     }
 
 
@@ -634,12 +743,18 @@ def decode_output(raw_output, schema: Dict, task_types: List[str] = None) -> Dic
         for item in classifications
         if isinstance(item, dict) and item.get("task")
     }
+    cls_meta = schema.get("_meta", {}).get("classifications", {}) if isinstance(schema, dict) else {}
     for key, value in results.items():
         if not isinstance(value, dict) or value.get("type") != "classification":
             continue
         config = classification_config.get(key, {})
         if config:
             value["multi_label"] = bool(config.get("multi_label", False))
+        meta_entry = cls_meta.get(key, {})
+        if meta_entry.get("cls_threshold") is not None:
+            value["cls_threshold"] = meta_entry["cls_threshold"]
+        elif config.get("cls_threshold") is not None:
+            value["cls_threshold"] = config["cls_threshold"]
 
     return results
 
@@ -708,12 +823,13 @@ def format_results(
             logits = value.get("logits", [])
             labels = value.get("labels", [])
             multi_label = bool(value.get("multi_label", False))
+            effective_threshold = value.get("cls_threshold", threshold)
             if multi_label:
                 probs = torch.sigmoid(torch.tensor(logits))
                 selected = [
                     (label, probs[idx].item())
                     for idx, label in enumerate(labels)
-                    if probs[idx].item() >= (0.5 if threshold is None else threshold)
+                    if probs[idx].item() >= (0.5 if effective_threshold is None else effective_threshold)
                 ]
                 if include_confidence:
                     formatted[key] = [
@@ -725,7 +841,7 @@ def format_results(
                 probs = torch.softmax(torch.tensor(logits), dim=-1)
                 best = int(probs.argmax().item())
                 best_score = probs[best].item()
-                if threshold is not None and best_score < threshold:
+                if effective_threshold is not None and best_score < effective_threshold:
                     formatted[key] = None
                 elif include_confidence:
                     formatted[key] = {"label": labels[best], "confidence": best_score}
