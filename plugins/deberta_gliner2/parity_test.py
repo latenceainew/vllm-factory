@@ -1,14 +1,24 @@
 """
-GLiNER2 Parity Test — fastino/gliner2-large-v1
+GLiNER2 Parity Test — covers both supported checkpoint variants.
 
 Two-phase design:
     Phase 1 (--prepare): GLiNER2 reference + model dir preparation
     Phase 2 (--test):    vLLM inference + parity comparison
 
+The ``--model`` flag selects the HF checkpoint and picks the ``counting_layer``
+variant exercised by the pooler:
+
+    large  →  fastino/gliner2-large-v1   (counting_layer == "count_lstm")
+    base   →  fastino/gliner2-base-v1    (counting_layer == "count_lstm_v2")
+
+With no flags the script runs both phases for *both* variants in sequence so
+any regression in the non-``count_lstm`` path surfaces immediately (see the
+long-lived silent-drop bug fixed by the PR that introduced this.)
+
 Usage:
-    python plugins/deberta_gliner2/parity_test.py --prepare
-    python plugins/deberta_gliner2/parity_test.py --test
-    python plugins/deberta_gliner2/parity_test.py           # both in sequence
+    python plugins/deberta_gliner2/parity_test.py --prepare --model base
+    python plugins/deberta_gliner2/parity_test.py --test    --model base
+    python plugins/deberta_gliner2/parity_test.py                           # all variants
 """
 
 import argparse
@@ -18,9 +28,25 @@ import subprocess
 import sys
 import time
 
-MODEL = "fastino/gliner2-large-v1"
-LOCAL_MODEL_DIR = "/tmp/gliner2-vllm"
-REF_FILE = "/tmp/gliner2-reference.json"
+# Short-name → (HF repo, local model dir, reference-JSON path).
+# The two variants correspond to the two ``counting_layer`` values used by
+# every currently-published GLiNER2 checkpoint.
+MODELS: dict[str, tuple[str, str, str]] = {
+    "large": (
+        "fastino/gliner2-large-v1",
+        "/tmp/gliner2-large-vllm",
+        "/tmp/gliner2-large-reference.json",
+    ),
+    "base": (
+        "fastino/gliner2-base-v1",
+        "/tmp/gliner2-base-vllm",
+        "/tmp/gliner2-base-reference.json",
+    ),
+}
+
+# Default / fallback — kept for backwards compatibility with any external
+# invocation that imports these module-level names.
+MODEL, LOCAL_MODEL_DIR, REF_FILE = MODELS["large"]
 
 TEXT = (
     "John Smith works at NVIDIA Corporation in Santa Clara, California. "
@@ -37,15 +63,17 @@ THRESHOLD = 0.5
 # ======================================================================
 
 
-def phase_prepare():
+def phase_prepare(
+    model_name: str = MODEL, local_model_dir: str = LOCAL_MODEL_DIR, ref_file: str = REF_FILE
+):
     import safetensors.torch
     from gliner2 import GLiNER2
 
     print("=" * 60)
-    print("PHASE 1: GLiNER2 Reference + Model Directory")
+    print(f"PHASE 1: GLiNER2 Reference + Model Directory ({model_name})")
     print("=" * 60)
 
-    model = GLiNER2.from_pretrained(MODEL)
+    model = GLiNER2.from_pretrained(model_name)
     model.eval()
 
     # Generate entity reference
@@ -115,7 +143,7 @@ def phase_prepare():
 
     # Save references
     refs = {
-        "model": MODEL,
+        "model": model_name,
         "text": TEXT,
         "entities": entities,
         "classification": classification,
@@ -123,9 +151,9 @@ def phase_prepare():
         "json_structure": json_result,
         "per_threshold_entities": per_threshold_entities,
     }
-    with open(REF_FILE, "w") as f:
+    with open(ref_file, "w") as f:
         json.dump(refs, f, indent=2, default=str)
-    print(f"\nSaved references to {REF_FILE}")
+    print(f"\nSaved references to {ref_file}")
 
     # Prepare vLLM model dir
     ec = model.encoder.config
@@ -160,8 +188,8 @@ def phase_prepare():
         "token_pooling": model.config.token_pooling,
     }
 
-    os.makedirs(LOCAL_MODEL_DIR, exist_ok=True)
-    with open(os.path.join(LOCAL_MODEL_DIR, "config.json"), "w") as f:
+    os.makedirs(local_model_dir, exist_ok=True)
+    with open(os.path.join(local_model_dir, "config.json"), "w") as f:
         json.dump(vllm_config, f, indent=2)
 
     # Save weights
@@ -175,11 +203,14 @@ def phase_prepare():
             seen.add(ptr)
         else:
             deduped[k] = v.clone().contiguous().cpu()
-    safetensors.torch.save_file(deduped, os.path.join(LOCAL_MODEL_DIR, "model.safetensors"))
+    safetensors.torch.save_file(deduped, os.path.join(local_model_dir, "model.safetensors"))
 
     # Save tokenizer
-    model.processor.tokenizer.save_pretrained(LOCAL_MODEL_DIR)
-    print(f"Model dir: {LOCAL_MODEL_DIR} ({len(deduped)} weights)")
+    model.processor.tokenizer.save_pretrained(local_model_dir)
+    print(
+        f"Model dir: {local_model_dir} ({len(deduped)} weights, "
+        f"counting_layer={model.config.counting_layer})"
+    )
     print("✅ Phase 1 complete\n")
 
 
@@ -188,7 +219,9 @@ def phase_prepare():
 # ======================================================================
 
 
-def phase_test():
+def phase_test(
+    model_name: str = MODEL, local_model_dir: str = LOCAL_MODEL_DIR, ref_file: str = REF_FILE
+) -> bool:
     from transformers import AutoTokenizer
     from vllm import LLM, PoolingParams
     from vllm.inputs import TokensPrompt
@@ -201,14 +234,14 @@ def phase_test():
     )
 
     print("=" * 60)
-    print("PHASE 2: vLLM Inference + Parity")
+    print(f"PHASE 2: vLLM Inference + Parity ({model_name})")
     print("=" * 60)
 
     # Load references
-    with open(REF_FILE) as f:
+    with open(ref_file) as f:
         ref = json.load(f)
 
-    tokenizer = AutoTokenizer.from_pretrained(LOCAL_MODEL_DIR)
+    tokenizer = AutoTokenizer.from_pretrained(local_model_dir)
 
     # ---- TEST 1: Entity Extraction ----
     print("\n--- TEST 1: Entity Extraction ---")
@@ -228,7 +261,7 @@ def phase_test():
     prep = {k: v for k, v in prep.items() if k != "input_ids"}
 
     vllm_model = LLM(
-        model=LOCAL_MODEL_DIR,
+        model=local_model_dir,
         trust_remote_code=True,
         enforce_eager=True,
         dtype="bfloat16",
@@ -509,30 +542,55 @@ def phase_test():
 
     # Final summary
     print("\n" + "=" * 60)
-    print("SUMMARY")
+    print(f"SUMMARY — {model_name}")
     print("=" * 60)
     print(f"Entity F1:         {f1:.4f}")
     print(f"Classification:    {'✅' if cls_match else '❌'}")
     print(f"Per-threshold:     {'✅' if threshold_effective else '⚠️'}")
     print(f"Latency:           {latency:.1f}ms")
-    status = "✅ PARITY OK" if f1 >= 0.8 and cls_match and threshold_effective else "⚠️  NEEDS WORK"
+    passed = f1 >= 0.8 and cls_match and threshold_effective
+    status = "✅ PARITY OK" if passed else "⚠️  NEEDS WORK"
     print(status)
+    return passed
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="GLiNER2 Parity Test")
     parser.add_argument("--prepare", action="store_true")
     parser.add_argument("--test", action="store_true")
+    parser.add_argument(
+        "--model",
+        choices=sorted(MODELS.keys()),
+        default=None,
+        help="Which GLiNER2 variant to exercise (default: all, in sequence).",
+    )
     args = parser.parse_args()
 
+    selected = [args.model] if args.model else list(MODELS.keys())
+
     if args.prepare:
-        phase_prepare()
+        for key in selected:
+            hf, ldir, rfile = MODELS[key]
+            phase_prepare(hf, ldir, rfile)
     elif args.test:
-        phase_test()
+        all_passed = True
+        for key in selected:
+            hf, ldir, rfile = MODELS[key]
+            if not phase_test(hf, ldir, rfile):
+                all_passed = False
+        sys.exit(0 if all_passed else 1)
     else:
-        print("Running both phases in separate processes...\n")
-        r1 = subprocess.run([sys.executable, __file__, "--prepare"], cwd=os.getcwd())
-        if r1.returncode != 0:
-            sys.exit(r1.returncode)
-        r2 = subprocess.run([sys.executable, __file__, "--test"], cwd=os.getcwd())
-        sys.exit(r2.returncode)
+        print(f"Running both phases in separate processes for variants={selected}...\n")
+        for key in selected:
+            r1 = subprocess.run(
+                [sys.executable, __file__, "--prepare", "--model", key],
+                cwd=os.getcwd(),
+            )
+            if r1.returncode != 0:
+                sys.exit(r1.returncode)
+            r2 = subprocess.run(
+                [sys.executable, __file__, "--test", "--model", key],
+                cwd=os.getcwd(),
+            )
+            if r2.returncode != 0:
+                sys.exit(r2.returncode)

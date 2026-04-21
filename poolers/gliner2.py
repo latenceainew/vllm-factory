@@ -20,6 +20,7 @@ from typing import Any, Dict, List
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from vllm_factory.pooling.protocol import PoolerContext, split_hidden_states
 
@@ -76,6 +77,150 @@ class CountLSTM(nn.Module):
         h0 = pc_emb.unsqueeze(0)
         output, _ = self.gru(pos_seq, h0)
         return self.projector(torch.cat([output, pc_emb.unsqueeze(0).expand_as(output)], dim=-1))
+
+
+# ==================================================================
+# DownscaledTransformer (mirrors gliner2.layers.DownscaledTransformer)
+# ==================================================================
+
+class DownscaledTransformer(nn.Module):
+    """Bottleneck transformer used as the projector inside ``CountLSTMv2``.
+
+    Projects the GRU output into a small hidden space, runs a two-layer
+    ``nn.TransformerEncoder``, concatenates the transformer output with the
+    original input, and projects back to ``input_size``. State-dict keys
+    match the native ``gliner2.layers.DownscaledTransformer`` exactly so
+    checkpoints produced with ``counting_layer == "count_lstm_v2"`` load
+    without any key remapping.
+    """
+
+    def __init__(self, input_size: int, hidden_size: int,
+                 num_heads: int = 4, num_layers: int = 2, dropout: float = 0.1):
+        super().__init__()
+        self.input_size = input_size
+        self.hidden_size = hidden_size
+        self.num_heads = num_heads
+        self.num_layers = num_layers
+
+        self.in_projector = nn.Linear(input_size, hidden_size)
+
+        encoder = nn.TransformerEncoderLayer(
+            d_model=hidden_size,
+            nhead=num_heads,
+            dim_feedforward=hidden_size * 2,
+            dropout=dropout,
+            batch_first=True,
+        )
+        self.transformer = nn.TransformerEncoder(encoder, num_layers=num_layers)
+
+        self.out_projector = create_mlp(
+            input_dim=hidden_size + input_size,
+            intermediate_dims=[input_size, input_size],
+            output_dim=input_size,
+            dropout=0.,
+            activation="relu",
+            add_layer_norm=False,
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        original_x = x
+        x = self.in_projector(x)
+        x = self.transformer(x)
+        x = torch.cat([x, original_x], dim=-1)
+        x = self.out_projector(x)
+        return x
+
+
+# ==================================================================
+# CountLSTMv2 (mirrors gliner2.layers.CountLSTMv2)
+# ==================================================================
+
+class CountLSTMv2(nn.Module):
+    """Count-aware unrolling with a ``DownscaledTransformer`` projector.
+
+    Drop-in replacement for ``CountLSTM`` used by GLiNER2 checkpoints whose
+    extractor config sets ``counting_layer == "count_lstm_v2"`` (e.g.
+    ``fastino/gliner2-base-v1``). Parameter names match upstream so
+    ``state_dict`` loads without remapping.
+    """
+
+    def __init__(self, hidden_size: int, max_count: int = 20):
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.max_count = max_count
+        self.pos_embedding = nn.Embedding(max_count, hidden_size)
+        self.gru = nn.GRU(input_size=hidden_size, hidden_size=hidden_size)
+        self.transformer = DownscaledTransformer(
+            input_size=hidden_size,
+            hidden_size=128,
+            num_heads=4,
+            num_layers=2,
+            dropout=0.1,
+        )
+
+    def forward(self, pc_emb: torch.Tensor, gold_count_val: int) -> torch.Tensor:
+        M, D = pc_emb.shape
+        gold_count_val = min(gold_count_val, self.max_count)
+        full_idx = torch.arange(self.max_count, device=pc_emb.device)
+        count_idx = full_idx[:gold_count_val]
+        pos_seq = self.pos_embedding(count_idx).unsqueeze(1).expand(-1, M, -1)
+        output, _ = self.gru(pos_seq, pc_emb.unsqueeze(0))
+        pc_broadcast = pc_emb.unsqueeze(0).expand_as(output)
+        return self.transformer(output + pc_broadcast)
+
+
+# ==================================================================
+# CountLSTMoE (mirrors gliner2.layers.CountLSTMoE)
+# ==================================================================
+
+class CountLSTMoE(nn.Module):
+    """Count-aware unrolling with a packed-expert MoE projector.
+
+    Drop-in replacement for ``CountLSTM`` used by GLiNER2 checkpoints whose
+    extractor config sets ``counting_layer == "count_lstm_moe"``. Parameter
+    names (``w1``/``b1``/``w2``/``b2``/``router.*``) match upstream so
+    ``state_dict`` loads without remapping.
+    """
+
+    def __init__(self, hidden_size: int, max_count: int = 20,
+                 n_experts: int = 4, ffn_mult: int = 2, dropout: float = 0.1):
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.max_count = max_count
+        self.n_experts = n_experts
+
+        self.pos_embedding = nn.Embedding(max_count, hidden_size)
+        self.gru = nn.GRU(input_size=hidden_size, hidden_size=hidden_size)
+
+        inner = hidden_size * ffn_mult
+        self.w1 = nn.Parameter(torch.empty(n_experts, hidden_size, inner))
+        self.b1 = nn.Parameter(torch.zeros(n_experts, inner))
+        self.w2 = nn.Parameter(torch.empty(n_experts, inner, hidden_size))
+        self.b2 = nn.Parameter(torch.zeros(n_experts, hidden_size))
+        nn.init.xavier_uniform_(self.w1)
+        nn.init.xavier_uniform_(self.w2)
+
+        self.dropout = nn.Dropout(dropout)
+
+        self.router = nn.Sequential(
+            nn.Linear(hidden_size, hidden_size),
+            nn.GELU(),
+            nn.Linear(hidden_size, n_experts),
+            nn.Softmax(dim=-1),
+        )
+
+    def forward(self, pc_emb: torch.Tensor, gold_count_val: int) -> torch.Tensor:
+        M, D = pc_emb.shape
+        L = min(gold_count_val, self.max_count)
+        idx = torch.arange(L, device=pc_emb.device)
+        pos_seq = self.pos_embedding(idx).unsqueeze(1).expand(L, M, D)
+        h, _ = self.gru(pos_seq, pc_emb.unsqueeze(0))
+        gates = self.router(h)
+        x = torch.einsum("lmd,edh->lmeh", h, self.w1) + self.b1
+        x = F.gelu(x)
+        x = self.dropout(x)
+        x = torch.einsum("lmeh,ehd->lmed", x, self.w2) + self.b2
+        return (gates.unsqueeze(-1) * x).sum(dim=2)
 
 
 # ==================================================================
@@ -169,6 +314,7 @@ class GLiNER2Pooler(nn.Module):
         super().__init__()
         self.hidden_size = hidden_size
         self.max_width = max_width
+        self.counting_layer = counting_layer
 
         # Span representation
         self.span_rep = SpanRepLayer(
@@ -188,8 +334,24 @@ class GLiNER2Pooler(nn.Module):
             output_dim=20, dropout=0., activation="relu", add_layer_norm=False,
         )
 
-        # Count embedding (CountLSTM)
-        self.count_embed = CountLSTM(hidden_size)
+        # Count embedding — mirror gliner2/model.py so every checkpoint
+        # variant produced by the native repo (count_lstm / count_lstm_v2 /
+        # count_lstm_moe) loads into a pooler whose state_dict keys match
+        # exactly. Silently defaulting to CountLSTM regardless of config
+        # value would let non-count_lstm checkpoints load with a mostly
+        # random-init count_embed (load_state_dict strict=False drops the
+        # mismatched keys) and produce semantically-wrong output.
+        if counting_layer == "count_lstm":
+            self.count_embed = CountLSTM(hidden_size)
+        elif counting_layer == "count_lstm_v2":
+            self.count_embed = CountLSTMv2(hidden_size=hidden_size)
+        elif counting_layer == "count_lstm_moe":
+            self.count_embed = CountLSTMoE(hidden_size=hidden_size)
+        else:
+            raise ValueError(
+                f"Unsupported counting_layer {counting_layer!r}; expected one of "
+                "'count_lstm', 'count_lstm_v2', 'count_lstm_moe'."
+            )
 
     # ── FactoryPooler protocol ───────────────────────────────────────────
 

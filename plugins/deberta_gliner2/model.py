@@ -170,16 +170,38 @@ class GLiNER2VLLMModel(nn.Module):
         self.encoder.load_weights(backbone_weights)
         logger.info("[GLiNER2] Loaded encoder: %s weight tensors", len(backbone_weights))
 
-        # Load pooler (use business pooler directly to avoid _inner. prefix mismatch)
+        # Load pooler (use business pooler directly to avoid _inner. prefix mismatch).
+        #
+        # We keep ``strict=False`` because backbone / ``deberta.*`` keys are
+        # loaded separately above — they'd otherwise show up as "unexpected"
+        # here. But we still guard against the failure mode that masked the
+        # count_lstm_v2 / count_lstm_moe incompatibility for months: with
+        # the wrong ``GLiNER2Pooler.count_embed`` variant, every
+        # ``count_embed.*`` key beyond the shared pos_embedding + GRU is
+        # silently dropped and inference proceeds with a mostly random-init
+        # count_embed. Compute expected / actual key sets from the pooler
+        # + filtered weights and raise if anything was dropped.
         if pooler_loaded:
+            missing = pooler_keys - pooler_loaded.keys()
+            unexpected = pooler_loaded.keys() - pooler_keys
+            if missing or unexpected:
+                raise RuntimeError(
+                    "GLiNER2 pooler weight-load mismatch — "
+                    f"counting_layer={getattr(self.config, 'counting_layer', '?')!r} "
+                    f"missing={sorted(missing)!r} unexpected={sorted(unexpected)!r}. "
+                    "This indicates a pooler variant / checkpoint mismatch: "
+                    "the pooler's count_embed class does not match the "
+                    "checkpoint's counting_layer."
+                )
             self._business_pooler.load_state_dict(pooler_loaded, strict=False)
             device = next(self.encoder.parameters()).device
             dtype = self.vllm_config.model_config.dtype
             self._business_pooler.to(device=device, dtype=dtype)
             logger.info(
-                "[GLiNER2] Loaded pooler: %s/%s keys",
+                "[GLiNER2] Loaded pooler: %s/%s keys (counting_layer=%s)",
                 len(pooler_loaded),
                 len(pooler_keys),
+                getattr(self.config, "counting_layer", "?"),
             )
         else:
             logger.warning("[GLiNER2] WARNING: No pooler weights loaded!")
