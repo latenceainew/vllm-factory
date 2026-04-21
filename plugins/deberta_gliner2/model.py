@@ -10,12 +10,13 @@ import importlib.util
 import logging
 import sys
 from pathlib import Path
-from typing import Iterable, Tuple
+from typing import ClassVar, Iterable, Tuple
 
 import torch
 import torch.nn as nn
 from transformers import DebertaV2Config
 from vllm.config import VllmConfig
+from vllm.model_executor.models.interfaces import SupportsLoRA
 
 from poolers.gliner2 import GLiNER2Pooler
 from vllm_factory.pooling.vllm_adapter import VllmPoolerAdapter
@@ -40,12 +41,33 @@ def _import_deberta_v2_encoder():
 
 _encoder_mod = _import_deberta_v2_encoder()
 DebertaV2EncoderModel = _encoder_mod.DebertaV2EncoderModel
+_ENCODER_PACKED_MODULES_MAPPING: dict[str, list[str]] = _encoder_mod.PACKED_MODULES_MAPPING
+_ENCODER_EMBEDDING_MODULES: dict[str, str] = _encoder_mod.EMBEDDING_MODULES
 
 
-class GLiNER2VLLMModel(nn.Module):
-    """GLiNER2 model for vLLM: custom vLLM-optimized encoder backbone + GLiNER2 pooler head."""
+class GLiNER2VLLMModel(nn.Module, SupportsLoRA):
+    """GLiNER2 model for vLLM: custom vLLM-optimized encoder backbone + GLiNER2 pooler head.
+
+    Declares `SupportsLoRA` and forwards the DeBERTa v2/v3 backbone's LoRA
+    metadata under the ``encoder.`` prefix — the plugin wraps the encoder as
+    ``self.encoder``, so every adapter target resolved by vLLM's LoRA manager
+    walks through that attribute. PEFT adapters produced against the GLiNER2
+    DeBERTa backbone (``target_modules=["query_proj", "key_proj",
+    "value_proj"]`` by convention) are registered directly by layer name; no
+    packing rewrite is needed. The pooler head (``span_rep`` / ``classifier``
+    / ``count_pred`` / ``count_embed``) is **not** adapter-eligible in this
+    PR — GLiNER2 LoRA recipes adapt the transformer backbone only.
+    """
 
     is_pooling_model = True
+    supports_lora: ClassVar[bool] = True
+    packed_modules_mapping: ClassVar[dict[str, list[str]]] = {
+        f"encoder.{k}": [f"encoder.{n}" for n in v]
+        for k, v in _ENCODER_PACKED_MODULES_MAPPING.items()
+    }
+    embedding_modules: ClassVar[dict[str, str]] = {
+        f"encoder.{k}": v for k, v in _ENCODER_EMBEDDING_MODULES.items()
+    }
 
     def __init__(self, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()

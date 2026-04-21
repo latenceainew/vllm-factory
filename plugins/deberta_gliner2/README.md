@@ -73,6 +73,29 @@ vllm serve /tmp/gliner2-vllm \
   --no-enable-prefix-caching --no-enable-chunked-prefill --port 8200
 ```
 
+### LoRA adapters
+
+`GLiNER2VLLMModel` declares vLLM's `SupportsLoRA` protocol, and the
+underlying DeBERTa v2/v3 backbone registers its parallel linears
+(`query_proj`, `key_proj`, `value_proj`, `pos_key_proj`, `pos_query_proj`,
+`attention.output.dense`, `intermediate.dense`, `output.dense`) as adapter
+targets. PEFT adapters produced against the GLiNER2 backbone with the
+default `target_modules=["query_proj", "key_proj", "value_proj"]` recipe
+map 1:1 onto our layer names — no packing rewrite is needed.
+
+```bash
+vllm serve /tmp/gliner2-vllm \
+  --trust-remote-code --dtype bfloat16 \
+  --no-enable-prefix-caching --no-enable-chunked-prefill \
+  --enable-lora --max-loras 32 --max-lora-rank 64 \
+  --port 8200
+```
+
+Adapter switching on the request path is wired in a follow-up PR
+(IOProcessor `adapter` field → `LoRARequest` via `engine.encode(...)`).
+The pooler head (`span_rep` / `classifier` / `count_pred` / `count_embed`)
+is intentionally **not** adapter-eligible.
+
 ## Verify
 
 ```bash

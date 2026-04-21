@@ -14,7 +14,7 @@ Weight loading supports HuggingFace DeBERTa checkpoints
 (e.g., microsoft/deberta-base, deberta-large, deberta-xlarge).
 """
 
-from typing import Iterable, Optional, Tuple
+from typing import ClassVar, Iterable, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -29,12 +29,39 @@ from vllm.model_executor.layers.linear import (
 )
 from vllm.model_executor.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
+from vllm.model_executor.models.interfaces import SupportsLoRA
 
 try:
     from kernels.flash_deberta_attention import HAS_TRITON, flash_deberta_attention
     HAS_FLASH_DEBERTA = HAS_TRITON
 except ImportError:
     HAS_FLASH_DEBERTA = False
+
+
+# ============================================================================
+# LoRA registration metadata
+# ============================================================================
+#
+# vLLM discovers adaptable linears by walking `named_modules()` and matching
+# against the LoRARequest's `target_modules`. All projections in this encoder
+# are already `ColumnParallelLinear`/`RowParallelLinear`, so vLLM's LoRA
+# manager can inject adapters into them without any further structural change.
+#
+# The mapping + class membership below satisfy the `SupportsLoRA` Protocol
+# check in `vllm.model_executor.models.interfaces.supports_lora(...)`.
+#
+# DeBERTa v1 uses a single fused `in_proj` (Q/K/V concatenated) exactly as HF
+# transformers does, so no packing rewrite is needed: PEFT adapters trained
+# against `target_modules=["in_proj"]` map 1:1. The relative-position linears
+# (`pos_proj`, `pos_q_proj`) are standard single-linear LoRA targets. Likewise
+# for `attention.output.dense`, `intermediate.dense`, and `output.dense`.
+#
+# `embedding_modules` is intentionally empty; GLiNER2/DeBERTa PEFT recipes do
+# not adapt the token embedding matrix, and keeping this empty avoids pulling
+# the vocab-parallel embedding into the LoRA path.
+
+PACKED_MODULES_MAPPING: dict[str, list[str]] = {}
+EMBEDDING_MODULES: dict[str, str] = {}
 
 
 # ============================================================================
@@ -670,8 +697,20 @@ class DebertaEncoder(nn.Module):
 # Top-Level Model
 # ============================================================================
 
-class DebertaEncoderModel(nn.Module):
-    """DeBERTa v1 encoder model for vLLM — returns hidden states only."""
+class DebertaEncoderModel(nn.Module, SupportsLoRA):
+    """DeBERTa v1 encoder model for vLLM — returns hidden states only.
+
+    Declares `SupportsLoRA` so vLLM's LoRA manager can inject adapters into
+    the encoder's `ColumnParallelLinear`/`RowParallelLinear` projections
+    (``in_proj``, ``pos_proj``, ``pos_q_proj``, ``attention.output.dense``,
+    ``intermediate.dense``, ``output.dense``). See the module-level
+    ``PACKED_MODULES_MAPPING`` / ``EMBEDDING_MODULES`` constants for the
+    rationale.
+    """
+
+    supports_lora: ClassVar[bool] = True
+    packed_modules_mapping: ClassVar[dict[str, list[str]]] = PACKED_MODULES_MAPPING
+    embedding_modules: ClassVar[dict[str, str]] = EMBEDDING_MODULES
 
     def __init__(self, vllm_config: VllmConfig = None, config: DebertaConfig = None,
                  prefix: str = ""):
@@ -756,4 +795,10 @@ class DebertaEncoderModel(nn.Module):
                 buffers_dict[param_name].copy_(loaded_weight)
 
 
-__all__ = ["DebertaEncoderModel", "DebertaEncoder", "DebertaLayerNorm"]
+__all__ = [
+    "DebertaEncoderModel",
+    "DebertaEncoder",
+    "DebertaLayerNorm",
+    "PACKED_MODULES_MAPPING",
+    "EMBEDDING_MODULES",
+]

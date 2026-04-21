@@ -18,7 +18,7 @@ Weight loading supports HuggingFace DeBERTa v2/v3 checkpoints
 (e.g., microsoft/deberta-v2-base, microsoft/deberta-v3-base).
 """
 
-from typing import Iterable, Optional, Tuple
+from typing import ClassVar, Iterable, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -33,12 +33,34 @@ from vllm.model_executor.layers.linear import (
 )
 from vllm.model_executor.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
+from vllm.model_executor.models.interfaces import SupportsLoRA
 
 try:
     from kernels.flash_deberta_attention import HAS_TRITON, flash_deberta_attention
     HAS_FLASH_DEBERTA = HAS_TRITON
 except ImportError:
     HAS_FLASH_DEBERTA = False
+
+
+# ============================================================================
+# LoRA registration metadata
+# ============================================================================
+#
+# DeBERTa v2/v3 uses separate `query_proj`, `key_proj`, `value_proj` linears —
+# matching HF transformers naming exactly — so PEFT adapters with
+# `target_modules=["query_proj", "key_proj", "value_proj"]` (the GLiNER2
+# convention) map 1:1 onto our `ColumnParallelLinear` projections with no
+# packing rewrite. `pos_key_proj` / `pos_query_proj` (when
+# ``share_att_key=False``) and the `attention.output.dense`,
+# `intermediate.dense`, `output.dense` row/column projections are standard
+# single-linear LoRA targets.
+#
+# `embedding_modules` is intentionally empty; GLiNER2 adapters do not touch
+# the token embedding matrix, and keeping it empty avoids pulling the vocab-
+# parallel embedding into the LoRA path.
+
+PACKED_MODULES_MAPPING: dict[str, list[str]] = {}
+EMBEDDING_MODULES: dict[str, str] = {}
 
 
 # ============================================================================
@@ -797,8 +819,20 @@ class DebertaV2Encoder(nn.Module):
 # Top-Level Model
 # ============================================================================
 
-class DebertaV2EncoderModel(nn.Module):
-    """DeBERTa v2/v3 encoder model for vLLM — returns hidden states only."""
+class DebertaV2EncoderModel(nn.Module, SupportsLoRA):
+    """DeBERTa v2/v3 encoder model for vLLM — returns hidden states only.
+
+    Declares `SupportsLoRA` so vLLM's LoRA manager can inject adapters into
+    the encoder's parallel linears (``query_proj``, ``key_proj``,
+    ``value_proj``, ``pos_key_proj``, ``pos_query_proj``,
+    ``attention.output.dense``, ``intermediate.dense``, ``output.dense``). See
+    the module-level ``PACKED_MODULES_MAPPING`` / ``EMBEDDING_MODULES``
+    constants for the rationale.
+    """
+
+    supports_lora: ClassVar[bool] = True
+    packed_modules_mapping: ClassVar[dict[str, list[str]]] = PACKED_MODULES_MAPPING
+    embedding_modules: ClassVar[dict[str, str]] = EMBEDDING_MODULES
 
     def __init__(self, vllm_config: VllmConfig = None, config: DebertaV2Config = None,
                  prefix: str = ""):
@@ -887,4 +921,9 @@ class DebertaV2EncoderModel(nn.Module):
                 buffers_dict[param_name].copy_(loaded_weight)
 
 
-__all__ = ["DebertaV2EncoderModel", "DebertaV2Encoder"]
+__all__ = [
+    "DebertaV2EncoderModel",
+    "DebertaV2Encoder",
+    "PACKED_MODULES_MAPPING",
+    "EMBEDDING_MODULES",
+]
