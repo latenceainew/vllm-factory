@@ -21,6 +21,14 @@ import pytest
 
 pytest.importorskip("vllm", reason="adapter wiring tests require vLLM imports")
 
+try:
+    from vllm.config import VllmConfig  # noqa: F401
+except Exception as exc:  # pragma: no cover - environment-dependent
+    pytest.skip(
+        f"vLLM importable but config unavailable ({exc!r})",
+        allow_module_level=True,
+    )
+
 
 @pytest.fixture()
 def parse_data():
