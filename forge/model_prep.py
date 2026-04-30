@@ -32,6 +32,11 @@ PLUGIN_REGISTRY = {
             "hidden_activation": "gelu",
         },
     },
+    "mmbert_gliner2": {
+        "model_type": "gliner2_modernbert",
+        "architectures": ["GLiNER2ModernBertModel"],
+        "extra_fields": {},
+    },
     "deberta_gliner": {
         "model_type": "gliner_deberta_v2",
         "architectures": ["GLiNERDebertaV2Model"],
@@ -126,15 +131,25 @@ def prepare_model_for_vllm_if_needed(
     hf_config = _read_json(config_json_path) if config_json_path else {}
 
     if (
-        plugin == "deberta_gliner2"
-        and hf_config.get("model_type") == "extractor"
+        hf_config.get("model_type") == "extractor"
         and "encoder_config/config.json" in repo_files
     ):
-        return prepare_gliner2_model(
-            hf_model_id=model_ref,
-            output_dir=output_dir,
-            force=force,
-        )
+        enc_cfg_path = _download_file(model_ref, "encoder_config/config.json")
+        enc_cfg = _read_json(enc_cfg_path) if enc_cfg_path else {}
+        enc_model_type = enc_cfg.get("model_type", "")
+
+        if plugin == "mmbert_gliner2" or enc_model_type == "modernbert":
+            return prepare_mmbert_gliner2_model(
+                hf_model_id=model_ref,
+                output_dir=output_dir,
+                force=force,
+            )
+        if plugin == "deberta_gliner2":
+            return prepare_gliner2_model(
+                hf_model_id=model_ref,
+                output_dir=output_dir,
+                force=force,
+            )
 
     if "gliner_config.json" not in repo_files:
         return model_ref
@@ -261,6 +276,152 @@ def prepare_gliner2_model(
         "hidden=%s, encoder_layers=%s",
         vllm_config["encoder_hidden_size"],
         vllm_config["encoder_num_hidden_layers"],
+    )
+    return output_dir
+
+
+_TOKENIZER_FILES = [
+    "tokenizer.json",
+    "tokenizer_config.json",
+    "special_tokens_map.json",
+    "vocab.txt",
+    "merges.txt",
+    "added_tokens.json",
+    "tokenizer.model",
+]
+
+
+def _copy_tokenizer_files(
+    hf_model_id: str,
+    repo_files: list[str],
+    output_dir: str,
+) -> None:
+    """Download tokenizer files from HF repo and patch out unresolvable tokenizer_class."""
+    copied = 0
+    for fname in _TOKENIZER_FILES:
+        if fname not in repo_files:
+            continue
+        src = _download_file(hf_model_id, fname)
+        if src:
+            dst = os.path.join(output_dir, fname)
+            shutil.copy2(src, dst)
+            copied += 1
+
+    if copied == 0:
+        raise RuntimeError(f"No tokenizer files found in {hf_model_id}")
+
+    tok_cfg_path = os.path.join(output_dir, "tokenizer_config.json")
+    if os.path.exists(tok_cfg_path):
+        tok_cfg = _read_json(tok_cfg_path)
+        tc = tok_cfg.get("tokenizer_class", "")
+        known_classes = {
+            "BertTokenizer", "BertTokenizerFast",
+            "PreTrainedTokenizer", "PreTrainedTokenizerFast",
+            "DebertaV2Tokenizer", "DebertaV2TokenizerFast",
+            "T5Tokenizer", "T5TokenizerFast",
+        }
+        dirty = False
+        if tc and tc not in known_classes:
+            logger.info(
+                "Replacing unresolvable tokenizer_class '%s' with 'PreTrainedTokenizerFast'", tc
+            )
+            tok_cfg["tokenizer_class"] = "PreTrainedTokenizerFast"
+            dirty = True
+
+        est = tok_cfg.get("extra_special_tokens")
+        if isinstance(est, list):
+            tok_cfg["extra_special_tokens"] = {t: t for t in est}
+            dirty = True
+
+        if dirty:
+            with open(tok_cfg_path, "w") as f:
+                json.dump(tok_cfg, f, indent=2)
+
+
+def prepare_mmbert_gliner2_model(
+    hf_model_id: str,
+    output_dir: str | None = None,
+    force: bool = False,
+) -> str:
+    """Prepare a ModernBERT + GLiNER2 extractor repo for the mmbert_gliner2 plugin."""
+    if output_dir is None:
+        slug = hf_model_id.replace("/", "--")
+        output_dir = f"/tmp/{slug}-vllm"
+
+    config_path = os.path.join(output_dir, "config.json")
+    if os.path.exists(config_path) and not force:
+        cached = _read_json(config_path)
+        if cached.get("model_type") == "mmbert_gliner2":
+            logger.info("Model already prepared at %s", output_dir)
+            return output_dir
+        shutil.rmtree(output_dir, ignore_errors=True)
+
+    logger.info("Preparing %s for vLLM (mmbert_gliner2)...", hf_model_id)
+
+    repo_files = list_repo_files(hf_model_id)
+    extractor_cfg = _read_json(
+        _require_download(hf_model_id, "config.json", "GLiNER2 extractor config")
+    )
+    encoder_cfg = _read_json(
+        _require_download(hf_model_id, "encoder_config/config.json", "GLiNER2 encoder config")
+    )
+
+    os.makedirs(output_dir, exist_ok=True)
+
+    _copy_tokenizer_files(hf_model_id, repo_files, output_dir)
+
+    rope_params = encoder_cfg.get("rope_parameters", {})
+    full_attn_rope = rope_params.get("full_attention", {})
+    sliding_attn_rope = rope_params.get("sliding_attention", {})
+
+    vllm_config = {
+        "model_type": "mmbert_gliner2",
+        "architectures": ["GLiNER2ModernBertModel"],
+        "num_hidden_layers": 0,
+        "num_attention_heads": 1,
+        "hidden_size": encoder_cfg.get("hidden_size", 384),
+        "encoder_num_layers": encoder_cfg.get("num_hidden_layers", 22),
+        "encoder_num_attention_heads": encoder_cfg.get("num_attention_heads", 6),
+        "intermediate_size": encoder_cfg.get("intermediate_size", 1152),
+        "vocab_size": encoder_cfg.get("vocab_size", 50368),
+        "max_position_embeddings": encoder_cfg.get("max_position_embeddings", 8192),
+        "hidden_activation": encoder_cfg.get("hidden_activation", "gelu"),
+        "norm_eps": encoder_cfg.get("layer_norm_eps", encoder_cfg.get("norm_eps", 1e-5)),
+        "pad_token_id": encoder_cfg.get("pad_token_id", 0),
+        "local_attention": encoder_cfg.get("local_attention", 128),
+        "global_attn_every_n_layers": encoder_cfg.get("global_attn_every_n_layers", 3),
+        "global_rope_theta": full_attn_rope.get("rope_theta", 160000.0),
+        "local_rope_theta": sliding_attn_rope.get("rope_theta", 160000.0),
+        "max_width": extractor_cfg.get("max_width", 12),
+        "counting_layer": extractor_cfg.get("counting_layer", "count_lstm_v2"),
+        "token_pooling": extractor_cfg.get("token_pooling", "first"),
+    }
+
+    with open(config_path, "w") as f:
+        json.dump(vllm_config, f, indent=2)
+
+    weight_files = [
+        f for f in repo_files
+        if f.endswith((".safetensors", ".bin", ".pt")) and "/" not in f
+    ]
+    if not weight_files:
+        raise RuntimeError(f"No model weights found for '{hf_model_id}'")
+    for wf in weight_files:
+        src = _require_download(hf_model_id, wf, "GLiNER2 weight file")
+        dst = os.path.join(output_dir, wf)
+        if not os.path.exists(dst):
+            try:
+                os.symlink(src, dst)
+            except OSError:
+                logger.info("Symlink failed for %s; copying instead", wf)
+                shutil.copy2(src, dst)
+
+    logger.info("Model prepared at %s", output_dir)
+    logger.info("Config: mmbert_gliner2, GLiNER2ModernBertModel")
+    logger.info(
+        "hidden=%s, encoder_layers=%s",
+        vllm_config["hidden_size"],
+        vllm_config["encoder_num_layers"],
     )
     return output_dir
 
