@@ -24,6 +24,7 @@ from torch import nn
 from transformers import DebertaV2Config
 from vllm.config import VllmConfig
 
+from plugins.modernbert_gliner_rerank.pooler import GLiNERRerankPooler
 from poolers.gliner import GLiNERSpanPooler
 from vllm_factory.pooling.vllm_adapter import VllmPoolerAdapter
 
@@ -102,9 +103,28 @@ class GLiNERDebertaV2Model(nn.Module):
         else:
             self.projection = None
 
-        # 3. GLiNER span pooler (shared implementation)
-        pooler_cfg = _make_pooler_config(cfg)
-        self._business_pooler = GLiNERSpanPooler(pooler_cfg)
+        self.is_token_level = cfg.span_mode == "token_level"
+        if self.is_token_level:
+            self.rnn = nn.LSTM(
+                input_size=self.pooler_hidden_size,
+                hidden_size=self.pooler_hidden_size // 2,
+                num_layers=1,
+                batch_first=True,
+                bidirectional=True,
+            )
+            hidden_size = self.pooler_hidden_size
+            self.scorer_proj_token = nn.Linear(hidden_size, hidden_size * 2)
+            self.scorer_proj_label = nn.Linear(hidden_size, hidden_size * 2)
+            self.scorer_out_mlp = nn.Sequential(
+                nn.Linear(hidden_size * 3, hidden_size * 4),
+                nn.Dropout(0.0),
+                nn.ReLU(),
+                nn.Linear(hidden_size * 4, 3),
+            )
+            self._business_pooler = GLiNERRerankPooler(self)
+        else:
+            pooler_cfg = _make_pooler_config(cfg)
+            self._business_pooler = GLiNERSpanPooler(pooler_cfg)
         self.pooler = VllmPoolerAdapter(self._business_pooler, requires_token_ids=True)
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
@@ -130,7 +150,9 @@ class GLiNERDebertaV2Model(nn.Module):
     ) -> torch.Tensor:
         """Run DeBERTa v2 encoder + projection, return hidden states for pooler."""
         with torch.no_grad():
-            hs = self.model(input_ids=input_ids)
+            hs = self._run_encoder(
+                input_ids=input_ids, positions=positions, inputs_embeds=inputs_embeds
+            )
 
         # Custom encoder returns tensor directly; flatten to 2D
         if hs.dim() == 3:
@@ -140,6 +162,46 @@ class GLiNERDebertaV2Model(nn.Module):
             hs = self.projection(hs)
 
         return hs
+
+    def _run_encoder(
+        self,
+        *,
+        input_ids: Optional[torch.LongTensor],
+        positions: Optional[torch.Tensor],
+        inputs_embeds: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        if input_ids is not None and input_ids.dim() == 1 and positions is not None:
+            pos = positions.to(device=input_ids.device)
+            starts = (pos == 0).nonzero(as_tuple=False).flatten().tolist()
+            if len(starts) > 1:
+                ends = starts[1:] + [input_ids.shape[0]]
+                lengths = [end - start for start, end in zip(starts, ends)]
+                max_len = max(lengths)
+                batch_size = len(lengths)
+                pad_id = int(getattr(self.config, "encoder_pad_token_id", 0))
+                batched_ids = input_ids.new_full((batch_size, max_len), pad_id)
+                batched_positions = pos.new_zeros((batch_size, max_len))
+                attention_mask = torch.zeros(
+                    (batch_size, max_len),
+                    dtype=torch.long,
+                    device=input_ids.device,
+                )
+                for row, (start, end, length) in enumerate(zip(starts, ends, lengths)):
+                    batched_ids[row, :length] = input_ids[start:end]
+                    batched_positions[row, :length] = pos[start:end]
+                    attention_mask[row, :length] = 1
+
+                encoded = self.model(
+                    input_ids=batched_ids,
+                    attention_mask=attention_mask,
+                    position_ids=batched_positions,
+                )
+                return torch.cat(
+                    [encoded[row, :length] for row, length in enumerate(lengths)],
+                    dim=0,
+                )
+
+        return self.model(input_ids=input_ids, position_ids=positions, inputs_embeds=inputs_embeds)
 
     # ------------------------------------------------------------------
     # Weight loading
@@ -170,6 +232,8 @@ class GLiNERDebertaV2Model(nn.Module):
         projection_state = {}
 
         pooler_keys = set(self._business_pooler.state_dict().keys())
+        rnn_state = {}
+        scorer_state = {}
 
         for hf_name, tensor in weights:
             if hf_name.startswith(backbone_prefix):
@@ -179,6 +243,12 @@ class GLiNERDebertaV2Model(nn.Module):
             elif hf_name.startswith(projection_prefix):
                 stripped = hf_name[len(projection_prefix) :]
                 projection_state[stripped] = tensor
+
+            elif self.is_token_level and hf_name.startswith("rnn.lstm."):
+                rnn_state[hf_name[len("rnn.lstm.") :]] = tensor
+
+            elif self.is_token_level and hf_name.startswith("scorer."):
+                scorer_state[hf_name[len("scorer.") :]] = tensor
 
             else:
                 vllm_key = hf_name
@@ -220,6 +290,34 @@ class GLiNERDebertaV2Model(nn.Module):
             )
         else:
             logger.warning("[GLiNERDebertaV2] No pooler weights loaded!")
+
+        if self.is_token_level:
+            device = next(self.model.parameters()).device
+            dtype = self.vllm_config.model_config.dtype
+            if rnn_state:
+                self.rnn.load_state_dict(rnn_state, strict=False)
+                self.rnn.to(device=device, dtype=dtype)
+                logger.info("[GLiNERDebertaV2] Loaded token-level LSTM")
+            if scorer_state:
+                for key, tensor in scorer_state.items():
+                    tensor = tensor.to(device=device, dtype=dtype)
+                    if key.startswith("proj_token."):
+                        getattr(self.scorer_proj_token, key[len("proj_token.") :]).data.copy_(
+                            tensor
+                        )
+                    elif key.startswith("proj_label."):
+                        getattr(self.scorer_proj_label, key[len("proj_label.") :]).data.copy_(
+                            tensor
+                        )
+                    elif key.startswith("out_mlp."):
+                        parts = key.split(".")
+                        idx = int(parts[1])
+                        attr_name = parts[2]
+                        getattr(self.scorer_out_mlp[idx], attr_name).data.copy_(tensor)
+                self.scorer_proj_token.to(device=device, dtype=dtype)
+                self.scorer_proj_label.to(device=device, dtype=dtype)
+                self.scorer_out_mlp.to(device=device, dtype=dtype)
+                logger.info("[GLiNERDebertaV2] Loaded token-level scorer")
 
         return set(name for name, _ in self.named_parameters())
 

@@ -219,7 +219,8 @@ class ParallelModernBertAttention(nn.Module):
 
         # 3. Apply HF RoPE (Standard Implementation)
         # Replaces vLLM kernel which had numerical issues with ModernBERT
-        cos, sin = self.rotary_emb(v, position_ids=position_ids)
+        layer_type = "full_attention" if self.is_global else "sliding_attention"
+        cos, sin = self.rotary_emb(v, position_ids=position_ids, layer_type=layer_type)
         q, k = self._apply_rotary_pos_emb(q, k, cos, sin)
 
         # 4. SDPA
@@ -335,6 +336,19 @@ class ModernBertModel(nn.Module):
         config._attn_implementation = 'sdpa'
         if hasattr(config, 'use_flash_attention_2'):
             config.use_flash_attention_2 = False
+
+        rope_parameters = getattr(config, "rope_parameters", None)
+        if isinstance(rope_parameters, dict):
+            full_attention = rope_parameters.get("full_attention")
+            sliding_attention = rope_parameters.get("sliding_attention")
+            if not hasattr(config, "global_rope_theta") and isinstance(full_attention, dict):
+                config.global_rope_theta = full_attention.get("rope_theta", 160000.0)
+            if not hasattr(config, "local_rope_theta") and isinstance(sliding_attention, dict):
+                config.local_rope_theta = sliding_attention.get("rope_theta", 10000.0)
+        if not hasattr(config, "global_rope_theta"):
+            config.global_rope_theta = getattr(config, "rope_theta", 160000.0)
+        if not hasattr(config, "local_rope_theta"):
+            config.local_rope_theta = getattr(config, "rope_theta", 10000.0)
 
         self.embeddings = VllmModernBertEmbeddings(config)
 

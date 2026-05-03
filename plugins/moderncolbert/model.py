@@ -12,7 +12,9 @@ vLLM 0.15.x compatible:
 """
 
 import importlib.util
+import json
 import logging
+import os
 import sys
 from pathlib import Path
 from typing import Iterable, Optional, Tuple
@@ -53,6 +55,46 @@ from .config import ModernColBERTConfig  # noqa: E402
 logger = logging.getLogger(__name__)
 
 
+_LEGACY_PROJECTION_MARKERS = (
+    "colbert_linear",
+    "projection",
+    "projector",
+    "1_Dense",
+    "2_Dense",
+    "3_Dense",
+)
+
+
+class _ResidualDense(nn.Module):
+    """PyLate Dense projection with optional residual branch."""
+
+    def __init__(
+        self,
+        in_features: int,
+        out_features: int,
+        *,
+        bias: bool = False,
+        use_residual: bool = False,
+    ) -> None:
+        super().__init__()
+        self.in_features = int(in_features)
+        self.out_features = int(out_features)
+        self.use_residual = bool(use_residual)
+        self.linear = nn.Linear(self.in_features, self.out_features, bias=bias)
+        self.residual = (
+            nn.Linear(self.in_features, self.out_features, bias=False)
+            if self.use_residual and self.in_features != self.out_features
+            else None
+        )
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        projected = self.linear(hidden_states)
+        if self.use_residual:
+            residual = hidden_states if self.residual is None else self.residual(hidden_states)
+            projected = projected + residual
+        return projected
+
+
 @attn_type("encoder_only")
 @default_pooling_type(tok_pooling_type="ALL")
 class ModernBertForColBERT(nn.Module):
@@ -81,6 +123,7 @@ class ModernBertForColBERT(nn.Module):
         self.model_path = vllm_config.model_config.model
         self.colbert_dim = getattr(config, "colbert_dim", 128)
         self.hidden_size = config.hidden_size
+        self._dense_specs = self._load_dense_specs()
 
         # 1. Backbone — custom ModernBERT with Triton kernels
         self.model = ModernBertModel(
@@ -88,12 +131,25 @@ class ModernBertForColBERT(nn.Module):
             prefix=f"{prefix}.model" if prefix else "model",
         )
 
-        # 2. ColBERT projection — Linear(hidden → colbert_dim), no bias
-        self.colbert_linear = nn.Linear(
-            config.hidden_size,
-            self.colbert_dim,
-            bias=False,
-        )
+        # 2. PyLate projection stack. LateOn ships three Dense modules:
+        #    768 -> 1536 (+ residual), 1536 -> 768 (+ residual), 768 -> 128.
+        #    Loading only the final projection is not parity-preserving.
+        self.projection_layers = nn.ModuleList()
+        if self._dense_specs:
+            for spec in self._dense_specs:
+                layer = _ResidualDense(
+                    int(spec["in_features"]),
+                    int(spec["out_features"]),
+                    bias=bool(spec.get("bias", False)),
+                    use_residual=bool(spec.get("use_residual", False)),
+                )
+                self.projection_layers.append(layer)
+            self.colbert_dim = int(self._dense_specs[-1]["out_features"])
+            config.colbert_dim = self.colbert_dim
+        else:
+            self.projection_layers.append(
+                _ResidualDense(config.hidden_size, self.colbert_dim, bias=False)
+            )
 
         # 3. vLLM pooler for token-level embedding task
         self.pooler = VllmPoolerAdapter(
@@ -102,6 +158,52 @@ class ModernBertForColBERT(nn.Module):
         )
 
         self._projection_loaded = False
+
+    def _resolve_hf_file(self, filename: str) -> Path | None:
+        local_file = Path(self.model_path) / filename
+        if local_file.exists():
+            return local_file
+        try:
+            from huggingface_hub import hf_hub_download
+
+            return Path(
+                hf_hub_download(
+                    repo_id=str(self.model_path),
+                    filename=filename,
+                    token=os.environ.get("HF_TOKEN"),
+                )
+            )
+        except Exception as exc:
+            logger.debug("Could not resolve %s from %s: %s", filename, self.model_path, exc)
+            return None
+
+    def _load_dense_specs(self) -> list[dict]:
+        modules_file = self._resolve_hf_file("modules.json")
+        if modules_file is None:
+            return []
+        try:
+            modules = json.loads(modules_file.read_text())
+        except Exception as exc:
+            logger.warning("Could not read ColBERT modules.json: %s", exc)
+            return []
+
+        specs: list[dict] = []
+        for module in modules:
+            path = str(module.get("path") or "")
+            module_type = str(module.get("type") or "")
+            if not path.endswith("_Dense") and "Dense" not in module_type:
+                continue
+            config_file = self._resolve_hf_file(f"{path}/config.json")
+            if config_file is None:
+                continue
+            try:
+                spec = json.loads(config_file.read_text())
+            except Exception as exc:
+                logger.warning("Could not read ColBERT Dense config %s: %s", path, exc)
+                continue
+            spec["path"] = path
+            specs.append(spec)
+        return specs
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         """Required by vLLM pooling runner for embeddings lookup."""
@@ -155,12 +257,12 @@ class ModernBertForColBERT(nn.Module):
         if hidden_states.dim() == 3:
             hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
 
-        # Dtype alignment
-        if self.colbert_linear.weight.dtype != hidden_states.dtype:
-            self.colbert_linear = self.colbert_linear.to(hidden_states.dtype)
-
-        # Project + L2 normalize (critical for MaxSim)
-        projected = self.colbert_linear(hidden_states)
+        # Project through the complete PyLate Dense stack + L2 normalize.
+        projected = hidden_states
+        for layer in self.projection_layers:
+            if next(layer.parameters()).dtype != projected.dtype:
+                layer.to(projected.dtype)
+            projected = layer(projected)
         projected = projected / projected.norm(dim=-1, keepdim=True).clamp(min=1e-8)
         return projected
 
@@ -175,11 +277,15 @@ class ModernBertForColBERT(nn.Module):
         params = dict(self.named_parameters())
 
         model_weights = []
-        projection_weights = {}
+        projection_weights = []
 
         for name, param in weights_list:
-            if any(k in name for k in ("1_Dense", "colbert_linear", "projection", "dense")):
-                projection_weights[name] = param
+            # SentenceTransformers Dense modules live in subdirectories and are
+            # loaded explicitly below. Legacy/custom ColBERT checkpoints may
+            # still stream a single projection weight; keep those candidates so
+            # one-layer models remain compatible.
+            if any(k in name for k in (*_LEGACY_PROJECTION_MARKERS, "projection_layers")):
+                projection_weights.append((name, param))
             else:
                 model_weights.append((name, param))
 
@@ -196,73 +302,97 @@ class ModernBertForColBERT(nn.Module):
                 weight_loader(params[mapped], loaded_weight)
                 loaded.add(mapped)
 
-        # Projection weights
-        for name, param in projection_weights.items():
-            if ("weight" in name.lower() or param.dim() == 2) and "colbert_linear.weight" in params:
-                target = params["colbert_linear.weight"]
-                if target.shape == param.shape:
-                    weight_loader = getattr(target, "weight_loader", default_weight_loader)
-                    weight_loader(target, param)
-                    loaded.add("colbert_linear.weight")
+        if self._load_projection_from_file():
+            loaded.update(name for name in params if name.startswith("projection_layers."))
+        elif self._load_projection_from_stream(projection_weights):
+            loaded.update(name for name in params if name.startswith("projection_layers."))
 
-        # Fallback: load projection from separate file (1_Dense/model.safetensors)
-        if "colbert_linear.weight" not in loaded:
-            if self._load_projection_from_file():
-                loaded.add("colbert_linear.weight")
-
-        self._projection_loaded = True
         # Mark constructor-initialized params as loaded for vLLM 0.19+ validation
         for name in dict(self.named_parameters()):
             loaded.add(name)
         return loaded
 
     def _ensure_projection_loaded(self):
-        """Safety net: load projection on first forward if missing."""
-        w = self.colbert_linear.weight.data
-        if w.float().std().item() < 0.001 or w.float().std().item() > 0.5:
+        """Safety net: load projection on first forward if vLLM skipped it."""
+        if not self._projection_loaded:
             self._load_projection_from_file()
-        self._projection_loaded = True
 
     def _load_projection_from_file(self) -> bool:
-        """Load ColBERT projection from 1_Dense/model.safetensors (local or HF Hub cache).
+        """Load the full PyLate Dense stack from *_Dense/model.safetensors.
 
         Returns True if the weight was loaded successfully, False otherwise.
         """
-        import os
-
         from safetensors import safe_open
 
-        dense_file = Path(self.model_path) / "1_Dense" / "model.safetensors"
+        if not self._dense_specs:
+            self._dense_specs = [{"path": "1_Dense"}]
 
-        if not dense_file.exists():
-            # Try HF Hub (works with local cache even when HF_HUB_OFFLINE=1)
-            try:
-                from huggingface_hub import hf_hub_download
+        loaded_ok = True
+        for idx, layer in enumerate(self.projection_layers):
+            path = str(self._dense_specs[idx].get("path", f"{idx + 1}_Dense"))
+            dense_file = self._resolve_hf_file(f"{path}/model.safetensors")
+            if dense_file is None or not dense_file.exists():
+                logger.warning("%s/model.safetensors not found for ColBERT projection", path)
+                loaded_ok = False
+                continue
 
-                dense_file = Path(
-                    hf_hub_download(
-                        repo_id=str(self.model_path),
-                        filename="1_Dense/model.safetensors",
-                        token=os.environ.get("HF_TOKEN"),
-                    )
-                )
-            except Exception as e:
-                logger.warning("Could not locate 1_Dense/model.safetensors: %s", e)
-                return False
+            logger.info("Loading ColBERT projection layer %s from %s", idx, dense_file)
+            with safe_open(str(dense_file), framework="pt", device="cpu") as f:
+                if "linear.weight" in f.keys():
+                    tensor = f.get_tensor("linear.weight")
+                    if layer.linear.weight.shape == tensor.shape:
+                        layer.linear.weight.data.copy_(tensor)
+                    else:
+                        logger.warning(
+                            "Shape mismatch for %s linear.weight: expected %s got %s",
+                            path,
+                            tuple(layer.linear.weight.shape),
+                            tuple(tensor.shape),
+                        )
+                        loaded_ok = False
+                if layer.residual is not None and "residual.weight" in f.keys():
+                    tensor = f.get_tensor("residual.weight")
+                    if layer.residual.weight.shape == tensor.shape:
+                        layer.residual.weight.data.copy_(tensor)
+                    else:
+                        logger.warning(
+                            "Shape mismatch for %s residual.weight: expected %s got %s",
+                            path,
+                            tuple(layer.residual.weight.shape),
+                            tuple(tensor.shape),
+                        )
+                        loaded_ok = False
 
-        if not dense_file.exists():
-            logger.warning("1_Dense/model.safetensors not found at %s", dense_file)
-            return False
+        self._projection_loaded = loaded_ok
+        return loaded_ok
 
-        logger.info("Loading ColBERT projection from %s", dense_file)
+    def _load_projection_from_stream(
+        self,
+        projection_weights: Iterable[Tuple[str, torch.Tensor]],
+    ) -> bool:
+        """Load legacy one-layer projection weights from the vLLM stream."""
+
         loaded_ok = False
-        with safe_open(str(dense_file), framework="pt", device="cpu") as f:
-            for key in f.keys():
-                tensor = f.get_tensor(key)
-                if (
-                    "weight" in key.lower() or tensor.dim() == 2
-                ) and self.colbert_linear.weight.shape == tensor.shape:
-                    self.colbert_linear.weight.data.copy_(tensor)
-                    logger.info("colbert_linear.weight loaded: %s", tensor.shape)
+        unmatched = list(projection_weights)
+        for layer_idx, layer in enumerate(self.projection_layers):
+            for attr_name in ("linear", "residual"):
+                module = getattr(layer, attr_name, None)
+                if module is None:
+                    continue
+                target = module.weight
+                for weight_idx, (name, tensor) in list(enumerate(unmatched)):
+                    if tensor.dim() != 2 or target.shape != tensor.shape:
+                        continue
+                    target.data.copy_(tensor)
+                    unmatched.pop(weight_idx)
                     loaded_ok = True
+                    logger.info(
+                        "Loaded ColBERT projection layer %s %s.weight from checkpoint stream key %s",
+                        layer_idx,
+                        attr_name,
+                        name,
+                    )
+                    break
+
+        self._projection_loaded = loaded_ok
         return loaded_ok

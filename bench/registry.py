@@ -382,6 +382,8 @@ def _prep_gliner_rerank():
 
 _MODERNCOLBERT_MODEL_ID = "VAGOsolutions/SauerkrautLM-Multi-Reason-ModernColBERT"
 _COLBERT_ZERO_MODEL_ID = "lightonai/ColBERT-Zero"
+# Canonical HF id uses capital O; resolves same as lightonai/lateon
+_LATEON_MODEL_ID = "lightonai/LateOn"
 _LFM2_COLBERT_MODEL_ID = "LiquidAI/LFM2-ColBERT-350M"
 _COLLFM2_MODEL_ID = "VAGOsolutions/SauerkrautLM-ColLFM2-450M-v0.1"
 _COLQWEN3_MODEL_ID = "VAGOsolutions/SauerkrautLM-ColQwen3-1.7b-Turbo-v0.1"
@@ -402,6 +404,8 @@ REGISTRY: list[PluginEntry] = [
         parity_metric="cosine_sim",
         dataset_label="BEIR SciFact 512 docs",
         request_task="token_embed",
+        # README / methodology: vs vanilla at batch_size=1 (not batched PyLate @ concurrency).
+        vanilla_batch_size=1,
     ),
     PluginEntry(
         plugin_name="colbert_zero",
@@ -416,6 +420,7 @@ REGISTRY: list[PluginEntry] = [
         dataset_label="BEIR SciFact 512 docs",
         request_task="token_embed",
         vanilla_kwargs={"prompt_name": "document"},
+        vanilla_batch_size=1,
     ),
     PluginEntry(
         plugin_name="lfm2_colbert",
@@ -429,6 +434,21 @@ REGISTRY: list[PluginEntry] = [
         parity_metric="cosine_sim",
         dataset_label="BEIR SciFact 512 docs",
         request_task="token_embed",
+        vanilla_batch_size=1,
+    ),
+    PluginEntry(
+        plugin_name="lateon",
+        model_id=_LATEON_MODEL_ID,
+        io_plugin="moderncolbert_io",
+        serve_flags=_colbert_flags(),
+        vanilla_family="pylate_colbert",
+        dataset_fn=dataset_scifact_colbert,
+        seq_len=512,
+        endpoint="/pooling",
+        parity_metric="cosine_sim",
+        dataset_label="BEIR SciFact 512 docs",
+        request_task="token_embed",
+        vanilla_batch_size=1,
     ),
     # ---- Vision retrieval (ColPali / ColEmbed) ---- #
     PluginEntry(

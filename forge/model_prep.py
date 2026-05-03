@@ -619,6 +619,7 @@ def prepare_gliner_model(
         "has_rnn": merged.get("has_rnn", True),
         "embed_ent_token": merged.get("embed_ent_token", True),
         "max_len": merged.get("max_len", 2048),
+        "span_mode": merged.get("span_mode", "markerV0"),
     }
 
     if gliner_span_hidden is not None:
@@ -653,6 +654,13 @@ def prepare_gliner_model(
     # Save config
     with open(config_path, "w") as f:
         json.dump(vllm_config, f, indent=2)
+
+    # Preserve the original GLiNER config for IO processors that need the
+    # native data processor/decoder stack (notably token-level GLiNER).
+    if gliner_config_path:
+        dst = os.path.join(output_dir, "gliner_config.json")
+        if not os.path.exists(dst):
+            os.symlink(gliner_config_path, dst)
 
     # Symlink model weight files
     weight_files = [f for f in repo_files if f.endswith((".safetensors", ".bin", ".pt"))]

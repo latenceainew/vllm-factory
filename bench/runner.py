@@ -635,5 +635,6 @@ def _known_parity(plugin_name: str) -> float:
         "deberta_gliner2": 1.000,
         "deberta_gliner_linker": 1.0000,
         "modernbert_gliner_rerank": 1.0000,
+        "lateon": 0.9700,
     }
     return scores.get(plugin_name, 0.0)
