@@ -3,14 +3,23 @@ IOProcessor plugin for moderncolbert — ColBERT multi-vector embeddings via
 vLLM's native IOProcessor pipeline.
 
 Handles text queries and document inputs with [Q]/[D] prefix insertion,
-returning multi-vector embeddings as a list of floats.
+returning multi-vector embeddings as base64-encoded flattened arrays.
 
 Entry-point group: vllm.io_processor_plugins
 Entry-point name:  moderncolbert_io
 
-Request format (online POST /pooling):
+Request format (online POST /pooling) — single text:
     Query: {"data": {"text": "What is ML?", "is_query": true}, "model": "...", "task": "plugin"}
     Doc:   {"data": {"text": "ML is ...", "is_query": false}, "model": "...", "task": "plugin"}
+
+Request format — batched (preferred for high-throughput callers):
+    {"data": {"text": ["q1", "q2", ...],
+              "is_query": [true, true, ...]},
+     "model": "...", "task": "plugin"}
+
+The batched form decomposes to N prompts in a single ``factory_pre_process``
+call so vLLM's continuous batcher fuses them into one engine step and the
+HTTP-side overhead drops from O(N) round trips to O(1).
 
 Request format (offline):
     llm.encode({"data": {"text": "What is ML?", "is_query": true}})
@@ -19,8 +28,8 @@ Request format (offline):
 from __future__ import annotations
 
 from collections.abc import Sequence
-from dataclasses import dataclass
-from typing import Any
+from dataclasses import dataclass, field
+from typing import Any, List
 
 import torch
 from transformers import AutoTokenizer
@@ -39,10 +48,17 @@ DOC_PREFIX_ID = 50369  # [D] with trailing space
 
 @dataclass
 class ModernColBERTInput:
-    """Validated embedding request after parse_request."""
+    """Validated embedding request after :meth:`factory_parse`.
 
-    text: str
-    is_query: bool = True
+    A single call always carries one or more ``texts`` (size 1 for the
+    legacy single-text request shape). The ``is_query_per_text`` list is
+    either user-provided or broadcast from the request-level ``is_query``
+    flag so each prompt picks the correct ``[Q]`` / ``[D]`` prefix.
+    """
+
+    texts: List[str] = field(default_factory=list)
+    is_query_per_text: List[bool] = field(default_factory=list)
+    batched: bool = False
 
 
 class ModernColBERTIOProcessor(FactoryIOProcessor):
@@ -50,11 +66,11 @@ class ModernColBERTIOProcessor(FactoryIOProcessor):
 
     Data flow:
         IOProcessorRequest(data={text, is_query})
-        → factory_parse        → ModernColBERTInput
-        → factory_pre_process  → TokensPrompt (with [Q]/[D] prefix at position 1)
-        → merge_pooling_params → PoolingParams(task="plugin", extra_kwargs={...})
-        → engine.encode        → PoolingRequestOutput
-        → factory_post_process → base64-encoded flattened multi-vector embeddings
+        → factory_parse        → ModernColBERTInput (list of N >= 1 texts)
+        → factory_pre_process  → Sequence[TokensPrompt] (with [Q]/[D] prefix per text)
+        → merge_pooling_params → PoolingParams(task="plugin")
+        → engine.encode        → Sequence[PoolingRequestOutput]
+        → factory_post_process → base64 string (single) OR list[str] (batched)
     """
 
     pooling_task = "token_embed"
@@ -81,61 +97,106 @@ class ModernColBERTIOProcessor(FactoryIOProcessor):
         if "text" not in data:
             raise ValueError("Request data must contain a 'text' key")
 
-        is_query = bool(data.get("is_query", True))
-        return ModernColBERTInput(text=data["text"], is_query=is_query)
+        text_field = data["text"]
+        is_query_field = data.get("is_query", True)
+
+        # Detect batched vs single shape. We treat "list/tuple of strings"
+        # as batched and "string" as single; lists with mixed types are an
+        # explicit error so callers don't silently mis-pack their batch.
+        if isinstance(text_field, (list, tuple)):
+            texts = [str(t) for t in text_field]
+            if not all(isinstance(t, str) for t in text_field):
+                raise ValueError("All elements of 'text' must be strings when batched")
+            if isinstance(is_query_field, (list, tuple)):
+                if len(is_query_field) != len(texts):
+                    raise ValueError(
+                        "'is_query' list length must match 'text' length when both are lists"
+                    )
+                is_query_per_text = [bool(x) for x in is_query_field]
+            else:
+                is_query_per_text = [bool(is_query_field)] * len(texts)
+            batched = True
+        else:
+            texts = [str(text_field)]
+            if isinstance(is_query_field, (list, tuple)):
+                if len(is_query_field) != 1:
+                    raise ValueError(
+                        "'is_query' list must have length 1 when 'text' is a single string"
+                    )
+                is_query_per_text = [bool(is_query_field[0])]
+            else:
+                is_query_per_text = [bool(is_query_field)]
+            batched = False
+
+        if not texts:
+            raise ValueError("Empty 'text' batch")
+
+        return ModernColBERTInput(
+            texts=texts,
+            is_query_per_text=is_query_per_text,
+            batched=batched,
+        )
 
     def factory_pre_process(
         self,
         parsed_input: ModernColBERTInput,
         request_id: str | None,
     ) -> PromptType | Sequence[PromptType]:
-        is_query = parsed_input.is_query
-        max_len = 256 if is_query else 8192
-        prefix_id = QUERY_PREFIX_ID if is_query else DOC_PREFIX_ID
+        prompts: list[TokensPrompt] = []
+        for text, is_query in zip(parsed_input.texts, parsed_input.is_query_per_text):
+            max_len = 256 if is_query else 8192
+            prefix_id = QUERY_PREFIX_ID if is_query else DOC_PREFIX_ID
 
-        tokens = self._tokenizer(
-            parsed_input.text,
-            add_special_tokens=True,
-            truncation=True,
-            max_length=max_len - 1,
-            padding=False,
-            return_tensors=None,
+            tokens = self._tokenizer(
+                text,
+                add_special_tokens=True,
+                truncation=True,
+                max_length=max_len - 1,
+                padding=False,
+                return_tensors=None,
+            )
+            ids = list(tokens["input_ids"])
+            input_ids = [int(ids[0]), int(prefix_id), *[int(t) for t in ids[1:]]]
+            prompts.append(TokensPrompt(prompt_token_ids=input_ids))
+
+        # Stash the batched flag so factory_post_process knows whether to
+        # return a single string (legacy shape) or a list (batched shape).
+        self._stash(
+            request_id=request_id,
+            meta={"batched": parsed_input.batched, "n": len(prompts)},
         )
-        input_ids = [tokens["input_ids"][0], prefix_id] + tokens["input_ids"][1:]
-        attention_mask = [1, 1] + tokens["attention_mask"][1:]
 
-        extra = {
-            "is_query": is_query,
-            "sequence_length": len(input_ids),
-            "attention_mask": attention_mask,
-            "input_ids": input_ids,
-        }
-
-        self._stash(extra_kwargs=extra)
-
-        return TokensPrompt(prompt_token_ids=input_ids)
+        if not parsed_input.batched and len(prompts) == 1:
+            return prompts[0]
+        return prompts
 
     def factory_post_process(
         self,
         model_output: Sequence[PoolingRequestOutput],
         request_meta: Any,
-    ) -> str:
+    ) -> Any:
         import base64
 
         if not model_output:
-            return ""
+            return [] if (request_meta or {}).get("batched") else ""
 
-        output = model_output[0]
-        raw = output.outputs.data
-        if raw is None:
-            return ""
+        encoded: list[str] = []
+        for output in model_output:
+            raw = output.outputs.data
+            if raw is None:
+                encoded.append("")
+                continue
+            if not isinstance(raw, torch.Tensor):
+                raw = torch.as_tensor(raw)
+            encoded.append(
+                base64.b64encode(raw.cpu().contiguous().to(torch.float32).numpy().tobytes()).decode(
+                    "ascii"
+                )
+            )
 
-        if not isinstance(raw, torch.Tensor):
-            raw = torch.as_tensor(raw)
-
-        return base64.b64encode(raw.cpu().contiguous().to(torch.float32).numpy().tobytes()).decode(
-            "ascii"
-        )
+        if (request_meta or {}).get("batched") or len(encoded) > 1:
+            return encoded
+        return encoded[0]
 
 
 def get_processor_cls() -> str:
