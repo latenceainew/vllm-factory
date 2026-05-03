@@ -1,9 +1,16 @@
 from __future__ import annotations
 
+import pytest
 import torch
 import torch.nn as nn
 
-from plugins.moderncolbert.model import ModernBertForColBERT, _ResidualDense
+try:
+    from plugins.moderncolbert.model import ModernBertForColBERT, _ResidualDense
+except ImportError as exc:  # pragma: no cover - environment-dependent
+    pytest.skip(
+        f"ModernColBERT projection tests require importable vLLM plugin stack ({exc!r})",
+        allow_module_level=True,
+    )
 
 
 def _projection_only_model(*layers: _ResidualDense) -> ModernBertForColBERT:
