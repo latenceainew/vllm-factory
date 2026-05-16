@@ -142,6 +142,7 @@ class Dispatcher:
 
         app = web.Application()
         app.router.add_route("*", "/health", self._handle_health)
+        app.router.add_route("*", "/stats", self._handle_stats)
         app.router.add_route("*", "/{path:.*}", self._handle_proxy)
 
         self._runner = web.AppRunner(app, access_log=None)
@@ -235,6 +236,28 @@ class Dispatcher:
             stats["affinity_misses"] += 1
         elif affinity_state == "fallback":
             stats["affinity_fallbacks"] += 1
+
+    def _snapshot_stats(self) -> dict[str, Any]:
+        return {
+            "requests": self._routing_stats["requests"],
+            "backend_counts": list(self._routing_stats["backend_counts"]),
+            "affinity_hits": self._routing_stats["affinity_hits"],
+            "affinity_misses": self._routing_stats["affinity_misses"],
+            "affinity_fallbacks": self._routing_stats["affinity_fallbacks"],
+            "request_affinity_enabled": self._enable_request_affinity,
+            "backend_urls": list(self._backend_urls),
+            "max_batch_size": self._max_bs,
+            "affinity_cache_entries": len(self._affinity_map),
+            "affinity_cache_size": self._affinity_cache_size,
+            "backend_capacity": [
+                {
+                    "backend_index": idx,
+                    "available_slots": sem._value,  # noqa: SLF001 - mirrors fast-path check
+                    "max_slots": self._max_bs,
+                }
+                for idx, sem in enumerate(self._semaphores)
+            ],
+        }
 
     @staticmethod
     def _build_route_headers(
@@ -458,3 +481,7 @@ class Dispatcher:
             text='{"error": "no healthy backends"}',
             content_type="application/json",
         )
+
+    async def _handle_stats(self, request: web.Request) -> web.Response:
+        """Return dispatcher-local routing and capacity counters."""
+        return web.json_response(self._snapshot_stats())

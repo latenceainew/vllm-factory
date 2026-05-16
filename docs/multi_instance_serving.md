@@ -45,7 +45,8 @@ curl -s http://localhost:8000/pooling \
                           ┌─────────────────────┐
                           │  Dispatcher (:8000)  │
                           │  async reverse proxy │
-                          │  round-robin + sema  │
+                          │ round-robin/affinity │
+                          │    + semaphores      │
                           └──┬───────┬───────┬───┘
                              │       │       │
                ┌─────────────┘       │       └─────────────┐
@@ -66,6 +67,28 @@ curl -s http://localhost:8000/pooling \
 3. **Per-backend concurrency cap** — each backend is guarded by an `asyncio.Semaphore(max_batch_size)`. When all backends are at capacity, new requests queue in FIFO order. The dispatcher never drops requests.
 4. **Backend selection** — round-robin with capacity preference by default. With `--enable-request-affinity`, JSON requests also get a stable request-shape key so repeated schema/labels-heavy calls can prefer the same backend-local cache when capacity is available. If the pinned backend is full, the dispatcher falls back to the normal round-robin-capacity path.
 5. **Health** — `GET /health` on the dispatcher returns 200 if at least one backend is healthy.
+6. **Stats** — `GET /stats` returns dispatcher-local routing counters and per-backend available slots so affinity behavior can be measured during benchmarks and live runs.
+
+## Runtime observability
+
+The dispatcher now exposes two lightweight runtime surfaces:
+
+- **Response headers** on proxied requests:
+  - `X-VLLM-Factory-Backend-Index`
+  - `X-VLLM-Factory-Affinity-State` (`disabled`, `miss`, `hit`, or `fallback`)
+  - `X-VLLM-Factory-Schema-Size` when the request body exposes `schema` or `labels`
+- **`GET /stats`** on the dispatcher:
+  - total routed requests
+  - per-backend request counts
+  - affinity hit / miss / fallback counters
+  - current affinity cache occupancy
+  - current available slots per backend
+
+Example:
+
+```bash
+curl -s http://localhost:8000/stats | jq
+```
 
 ## CLI reference
 
@@ -238,7 +261,7 @@ No backend is healthy. Check server logs in the terminal for startup errors. Com
 
 The multi-instance feature is implemented in three files:
 
-- **`forge/dispatcher.py`** — async HTTP reverse proxy built on `aiohttp.web`. Protocol-agnostic: forwards any path (`/pooling`, `/v1/embeddings`, `/health`, etc.) without inspecting request bodies. Per-backend concurrency is managed with `asyncio.Semaphore`.
+- **`forge/dispatcher.py`** — async HTTP reverse proxy built on `aiohttp.web`. It forwards any path (`/pooling`, `/v1/embeddings`, `/health`, `/stats`, etc.). When request affinity is disabled, request bodies stay opaque. When affinity is enabled, the dispatcher inspects JSON request shape to derive a stable routing key and emits lightweight routing stats and headers. Per-backend concurrency is managed with `asyncio.Semaphore`.
 - **`forge/multi_instance.py`** — orchestrator that creates N `ModelServer` instances with scaled GPU memory, starts them sequentially (to avoid CUDA allocation races), and launches the dispatcher.
 - **`forge/serve_cli.py`** — CLI entry point. When `--num-instances 1`, delegates directly to `ModelServer` with zero overhead. When N > 1, uses `MultiInstanceServer`.
 
