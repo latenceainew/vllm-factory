@@ -10,7 +10,6 @@ from __future__ import annotations
 import importlib.util
 import sys
 import types
-from collections import OrderedDict
 from pathlib import Path
 
 import pytest
@@ -19,9 +18,13 @@ import torch
 # Stub out vllm and vllm_factory before importing the pooler.
 _STUBS = {}
 for pkg_name in [
-    "vllm", "vllm.config", "vllm.distributed",
-    "vllm_factory", "vllm_factory.pooling",
-    "vllm_factory.pooling.protocol", "vllm_factory.pooling.vllm_adapter",
+    "vllm",
+    "vllm.config",
+    "vllm.distributed",
+    "vllm_factory",
+    "vllm_factory.pooling",
+    "vllm_factory.pooling.protocol",
+    "vllm_factory.pooling.vllm_adapter",
 ]:
     if pkg_name not in sys.modules:
         mod = types.ModuleType(pkg_name)
@@ -30,13 +33,18 @@ for pkg_name in [
         _STUBS[pkg_name] = mod
         sys.modules[pkg_name] = mod
 
-# Provide stub classes expected by imports
-sys.modules["vllm.config"].PoolerConfig = type("PoolerConfig", (), {})
-sys.modules["vllm_factory.pooling.protocol"].PoolerContext = type("PoolerContext", (), {})
-sys.modules["vllm_factory.pooling.protocol"].split_hidden_states = lambda *a, **kw: None
-sys.modules["vllm_factory.pooling.vllm_adapter"].VllmPoolerAdapter = type(
-    "VllmPoolerAdapter", (), {}
-)
+# Provide stub classes expected by imports — but only on modules we stubbed
+# ourselves. When the real module is already loaded (CI installs vllm), it
+# provides the real classes and must not be monkeypatched.
+if "vllm.config" in _STUBS:
+    _STUBS["vllm.config"].PoolerConfig = type("PoolerConfig", (), {})
+if "vllm_factory.pooling.protocol" in _STUBS:
+    _STUBS["vllm_factory.pooling.protocol"].PoolerContext = type("PoolerContext", (), {})
+    _STUBS["vllm_factory.pooling.protocol"].split_hidden_states = lambda *a, **kw: None
+if "vllm_factory.pooling.vllm_adapter" in _STUBS:
+    _STUBS["vllm_factory.pooling.vllm_adapter"].VllmPoolerAdapter = type(
+        "VllmPoolerAdapter", (), {}
+    )
 
 # Now import the pooler
 _POOLER_PATH = Path(__file__).resolve().parents[2] / "poolers" / "gliner2.py"
@@ -45,6 +53,16 @@ _pooler_mod = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(_pooler_mod)
 
 GLiNER2Pooler = _pooler_mod.GLiNER2Pooler
+
+# Remove the stubs again: the pooler module above holds its own references,
+# and leaving e.g. the empty-__path__ "vllm_factory.pooling" stub in
+# sys.modules poisons every later real import of vllm_factory.pooling.* in
+# this pytest process (CI-only ModuleNotFoundError for
+# vllm_factory.pooling.shape_prefix — locally these later tests skip because
+# vllm isn't installed, so the pollution went unnoticed).
+for _name, _mod in _STUBS.items():
+    if sys.modules.get(_name) is _mod:
+        del sys.modules[_name]
 
 
 @pytest.fixture
@@ -82,8 +100,14 @@ class TestDecodeEntitiesThresholds:
         end_map = [5, 12]
 
         result = pooler._decode_entities(
-            scores, ["person", "org"], text_len, text_tokens,
-            text, start_map, end_map, 0.5,
+            scores,
+            ["person", "org"],
+            text_len,
+            text_tokens,
+            text,
+            start_map,
+            end_map,
+            0.5,
         )
         assert len(result["entities"]["person"]) == 1
         assert len(result["entities"]["org"]) == 0
@@ -101,8 +125,14 @@ class TestDecodeEntitiesThresholds:
         end_map = [5, 12]
 
         result = pooler._decode_entities(
-            scores, ["person", "org"], text_len, text_tokens,
-            text, start_map, end_map, 0.5,
+            scores,
+            ["person", "org"],
+            text_len,
+            text_tokens,
+            text,
+            start_map,
+            end_map,
+            0.5,
             per_field_thresholds=[0.5, 0.2],
         )
         assert len(result["entities"]["person"]) == 1
@@ -121,8 +151,14 @@ class TestDecodeEntitiesThresholds:
         end_map = [5, 12]
 
         result = pooler._decode_entities(
-            scores, ["person", "org"], text_len, text_tokens,
-            text, start_map, end_map, 0.5,
+            scores,
+            ["person", "org"],
+            text_len,
+            text_tokens,
+            text,
+            start_map,
+            end_map,
+            0.5,
             per_field_thresholds=[0.9, 0.5],
         )
         assert len(result["entities"]["person"]) == 0
@@ -140,8 +176,14 @@ class TestDecodeEntitiesThresholds:
         end_map = [5, 12]
 
         result = pooler._decode_entities(
-            scores, ["person"], text_len, text_tokens,
-            text, start_map, end_map, 0.5,
+            scores,
+            ["person"],
+            text_len,
+            text_tokens,
+            text,
+            start_map,
+            end_map,
+            0.5,
             per_field_thresholds=None,
         )
         assert len(result["entities"]["person"]) == 1
@@ -161,9 +203,17 @@ class TestDecodeStructuresThresholds:
         end_map = [3, 6, 13]
 
         result = pooler._decode_structures(
-            scores, 1, ["date", "memo"], text_len, text_tokens,
-            text, start_map, end_map, 0.5,
-            "invoice", {},
+            scores,
+            1,
+            ["date", "memo"],
+            text_len,
+            text_tokens,
+            text,
+            start_map,
+            end_map,
+            0.5,
+            "invoice",
+            {},
             per_field_thresholds=[0.3, 0.2],
         )
         assert result["type"] == "json_structures"
@@ -184,9 +234,17 @@ class TestDecodeStructuresThresholds:
         end_map = [3, 7]
 
         result = pooler._decode_structures(
-            scores, 1, ["date"], text_len, text_tokens,
-            text, start_map, end_map, 0.5,
-            "invoice", {},
+            scores,
+            1,
+            ["date"],
+            text_len,
+            text_tokens,
+            text,
+            start_map,
+            end_map,
+            0.5,
+            "invoice",
+            {},
             per_field_thresholds=None,
         )
         assert result["instances"] == []
