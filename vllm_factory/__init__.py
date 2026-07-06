@@ -7,4 +7,4 @@ Subpackages:
     pooling  — pooler context / adapter layer decoupling pooler math from vLLM metadata
 """
 
-__version__ = "0.2.2"
+__version__ = "0.2.3"

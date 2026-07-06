@@ -6,6 +6,18 @@ The format is based on Keep a Changelog, and this project follows Semantic Versi
 
 ## [Unreleased]
 
+## [0.2.3] - 2026-07-06
+
+### Fixed
+- `vllm-factory-prep` now auto-detects GLiNER2 extractor repos whose encoder is `deberta-v2`/`deberta` (e.g. `fastino/gliner2-base-v1`) and routes them to the `deberta_gliner2` plugin without requiring an explicit `--plugin` flag. Previously only `modernbert` encoders were auto-detected, so these repos reported the misleading "not a GLiNER model" and serving failed. Extractor repos with an unrecognized encoder now raise a clear error instead of silently passing through. ([#20](https://github.com/ddickmann/vllm-factory/issues/20))
+- CI green again: resolved a `ruff format` violation in `plugins/deberta_gliner_linker/pooler.py` and a `sys.modules` stub leak in `tests/deberta_gliner2/test_pooler_thresholds.py` that poisoned later real imports of `vllm_factory.pooling.*` within a single pytest process (surfaced only in CI, where vLLM is installed).
+
+### Added
+- Dispatcher runtime observability: `GET /stats` endpoint (total routed requests, per-backend counts, affinity hit/miss/fallback counters, cache occupancy, available slots) plus `X-VLLM-Factory-*` routing response headers. Docs updated in `docs/multi_instance_serving.md`. ([#18](https://github.com/ddickmann/vllm-factory/pull/18), thanks @srimon12)
+
+### Changed
+- Removed the stale `tests/` entry from `.gitignore` — the suite is tracked and CI runs it; the ignore rule only blocked adding new tests.
+
 ## [0.2.2] - 2026-05-05
 
 ### Fixed

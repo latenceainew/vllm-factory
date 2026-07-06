@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "vllm-factory"
-version = "0.2.2"
+version = "0.2.3"
 description = "The LEGO set for custom vLLM model plugins — build, test, and deploy custom encoders, poolers, and kernels"
 readme = "README.md"
 license = {text = "Apache-2.0"}
