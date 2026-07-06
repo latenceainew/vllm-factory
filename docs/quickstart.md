@@ -5,7 +5,7 @@
 > **Critical: vLLM must be the last package installed.** This ensures it pins all shared dependencies (especially `transformers`) to compatible versions.
 
 ```bash
-git clone https://github.com/ddickmann/vllm-factory.git
+git clone https://github.com/latenceainew/vllm-factory.git
 cd vllm-factory
 
 # Install vllm-factory + GLiNER deps (skip [gliner] if you only need embedding/ColBERT models)

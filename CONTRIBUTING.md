@@ -5,7 +5,7 @@
 > **Critical: vLLM must be installed last.** The Makefile handles this automatically.
 
 ```bash
-git clone https://github.com/ddickmann/vllm-factory.git
+git clone https://github.com/latenceainew/vllm-factory.git
 cd vllm-factory
 make install          # installs deps in correct order + applies patch
 ```

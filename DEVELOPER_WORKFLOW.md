@@ -71,7 +71,7 @@ You only need to do this once:
 2. Click "Add a new pending publisher"
 3. Fill in:
    - PyPI project name: `vllm-factory`
-   - Owner: `ddickmann`
+   - Owner: `latenceainew`
    - Repository: `vllm-factory`
    - Workflow name: `release.yml`
    - Environment name: `pypi`

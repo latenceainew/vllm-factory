@@ -94,10 +94,10 @@ embeddinggemma_io = "plugins.embeddinggemma.io_processor:get_processor_cls"
 generic_pooling_io = "vllm_factory.composable.io_processor:get_processor_cls"
 
 [project.urls]
-Homepage = "https://github.com/ddickmann/vllm-factory"
-Documentation = "https://github.com/ddickmann/vllm-factory/tree/main/docs"
-Repository = "https://github.com/ddickmann/vllm-factory"
-Issues = "https://github.com/ddickmann/vllm-factory/issues"
+Homepage = "https://github.com/latenceainew/vllm-factory"
+Documentation = "https://github.com/latenceainew/vllm-factory/tree/main/docs"
+Repository = "https://github.com/latenceainew/vllm-factory"
+Issues = "https://github.com/latenceainew/vllm-factory/issues"
 
 [tool.setuptools.packages.find]
 include = ["forge*", "models*", "poolers*", "kernels*", "processors*", "plugins*", "vllm_factory*"]

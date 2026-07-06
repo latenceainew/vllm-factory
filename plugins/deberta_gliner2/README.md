@@ -209,7 +209,7 @@ groups requests with distinct `lora_int_id`s into a single step up to
 token in one fused forward pass. The pooler head (`span_rep` /
 `classifier` / `count_pred` / `count_embed`) is intentionally **not**
 adapter-eligible — only the DeBERTa backbone linears registered in
-[PR #11](https://github.com/ddickmann/vllm-factory/pull/11) receive LoRA.
+[PR #11](https://github.com/latenceainew/vllm-factory/pull/11) receive LoRA.
 
 ## Verify
 

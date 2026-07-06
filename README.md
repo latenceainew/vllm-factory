@@ -2,7 +2,7 @@
 
 **Production inference for encoders, poolers, and structured prediction — as vLLM plugins.**
 
-[![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://github.com/ddickmann/vllm-factory/blob/main/LICENSE)
+[![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://github.com/latenceainew/vllm-factory/blob/main/LICENSE)
 [![Python 3.11+](https://img.shields.io/badge/Python-3.11%2B-blue.svg)](https://python.org)
 [![vLLM 0.19+](https://img.shields.io/badge/vLLM-0.19%2B-green.svg)](https://github.com/vllm-project/vllm)
 [![Plugins](https://img.shields.io/badge/Plugins-12_models-purple.svg)](#plugins)
@@ -122,7 +122,7 @@ Or from source for development:
 ### Standard install
 
 ```bash
-git clone https://github.com/ddickmann/vllm-factory.git && cd vllm-factory
+git clone https://github.com/latenceainew/vllm-factory.git && cd vllm-factory
 
 # Step 1: Install vllm-factory + base dependencies (+ gliner for NER/linking models)
 pip install -e ".[gliner]"
@@ -592,7 +592,7 @@ GLiNER models show 10–30% throughput reduction at high concurrency (c≥32) co
 
 Running vLLM Factory in production? [Latence AI](https://latence.ai) provides custom plugin development, performance optimization, and deployment review.
 
-**→ [hello@latence.ai](mailto:hello@latence.ai) · [GitHub Issues](https://github.com/ddickmann/vllm-factory/issues)**
+**→ [hello@latence.ai](mailto:hello@latence.ai) · [GitHub Issues](https://github.com/latenceainew/vllm-factory/issues)**
 
 ## Contributing
 
@@ -621,13 +621,13 @@ make lint          # ruff check
 - [ ] Plugin authoring template with validation tooling and step-by-step generator
 - [ ] Upstream the 2 remaining monkey-patches (attention_mask forwarding, KV cache skip) to vLLM core
 
-Track progress in [GitHub Issues labeled `roadmap`](https://github.com/ddickmann/vllm-factory/issues?q=label%3Aroadmap).
+Track progress in [GitHub Issues labeled `roadmap`](https://github.com/latenceainew/vllm-factory/issues?q=label%3Aroadmap).
 
 ## Feedback and benchmark requests
 
-Want your encoder model benchmarked? [Open an issue](https://github.com/ddickmann/vllm-factory/issues/new) with the HuggingFace model ID and we'll add it to the queue. Include the task type (embedding, retrieval, NER, entity linking) and any specific concurrency or sequence length you care about.
+Want your encoder model benchmarked? [Open an issue](https://github.com/latenceainew/vllm-factory/issues/new) with the HuggingFace model ID and we'll add it to the queue. Include the task type (embedding, retrieval, NER, entity linking) and any specific concurrency or sequence length you care about.
 
-For bugs, feature requests, or plugin development questions, use [GitHub Issues](https://github.com/ddickmann/vllm-factory/issues) or [Discussions](https://github.com/ddickmann/vllm-factory/discussions).
+For bugs, feature requests, or plugin development questions, use [GitHub Issues](https://github.com/latenceainew/vllm-factory/issues) or [Discussions](https://github.com/latenceainew/vllm-factory/discussions).
 
 ## Acknowledgements
 
