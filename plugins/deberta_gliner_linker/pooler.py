@@ -123,7 +123,9 @@ class GLiNERLinkerPooler(nn.Module):
 
             W, C, S = scores.shape
             N = int(span_idx.shape[0])
-            flat = pack_shape_prefixed_tensor([W, C, S, N], scores, span_idx, span_mask, span_logits)
+            flat = pack_shape_prefixed_tensor(
+                [W, C, S, N], scores, span_idx, span_mask, span_logits
+            )
             outputs.append(flat)
 
         return outputs
