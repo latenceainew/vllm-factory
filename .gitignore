@@ -43,4 +43,3 @@ docs/io_processor_*.md
 
 # Internal scripts (reference generation, parity orchestrators, GLiNER helpers)
 scripts/
-tests/

@@ -141,12 +141,17 @@ def prepare_model_for_vllm_if_needed(
                 output_dir=output_dir,
                 force=force,
             )
-        if plugin == "deberta_gliner2":
+        if plugin == "deberta_gliner2" or enc_model_type in ("deberta-v2", "deberta"):
             return prepare_gliner2_model(
                 hf_model_id=model_ref,
                 output_dir=output_dir,
                 force=force,
             )
+        raise RuntimeError(
+            f"'{model_ref}' is a GLiNER2 extractor repo, but its encoder model_type "
+            f"'{enc_model_type}' has no registered plugin. Pass an explicit plugin "
+            "(e.g. --plugin deberta_gliner2 or --plugin mmbert_gliner2)."
+        )
 
     if "gliner_config.json" not in repo_files:
         return model_ref
