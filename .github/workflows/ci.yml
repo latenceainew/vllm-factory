@@ -67,6 +67,21 @@ jobs:
       - name: Build check (sdist + wheel)
         run: python -m build --sdist --wheel
 
+      - name: DEBUG import resolution (temporary)
+        run: |
+          pip show vllm-factory || true
+          pip list 2>/dev/null | grep -iE "vllm|factory" || true
+          cd /tmp && python -c "
+          import vllm_factory
+          print('vllm_factory:', vllm_factory.__file__)
+          import vllm_factory.pooling as p
+          print('pooling __path__:', list(p.__path__))
+          import importlib.util
+          spec = importlib.util.find_spec('vllm_factory.pooling.shape_prefix')
+          print('shape_prefix spec:', spec)
+          " || true
+          ls -la "$(pip show vllm-factory 2>/dev/null | awk '/^Location/{print $2}')/vllm_factory/pooling/" 2>/dev/null || true
+
       - name: Run CPU-safe tests
         run: |
           if [ -d tests ]; then pytest -q tests; else echo "No tests/ directory — skipping"; fi
