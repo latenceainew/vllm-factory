@@ -121,3 +121,21 @@ def test_non_gliner_repo_passes_through(monkeypatch, tmp_path):
     result = model_prep.prepare_model_for_vllm_if_needed("bert-base-uncased/x")
 
     assert result == "bert-base-uncased/x"
+
+
+def test_boundary_architecture_raises_instead_of_span_prepare(
+    monkeypatch, tmp_path, extractor_repo
+):
+    """A boundary checkpoint must not be silently prepared as a span model."""
+    extractor_repo["configs"]["config.json"] = {
+        "model_type": "extractor",
+        "architecture": "boundary",
+        "architectures": ["BoundaryExtractor"],
+        "model_name": "microsoft/mdeberta-v3-base",
+    }
+    extractor_repo["configs"]["encoder_config/config.json"] = {"model_type": "deberta-v2"}
+    _fake_hub(monkeypatch, tmp_path, extractor_repo["repo_files"], extractor_repo["configs"])
+    _route_called(monkeypatch)
+
+    with pytest.raises(RuntimeError, match="boundary"):
+        model_prep.prepare_model_for_vllm_if_needed("fastino/gliner2.5-multi-v1")

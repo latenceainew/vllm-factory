@@ -26,11 +26,11 @@ from pathlib import Path
 from typing import Iterable, Optional, Tuple
 
 import torch
-from gliner.modeling.span_rep import SpanRepLayer
 from torch import nn
 from transformers import DebertaConfig
 from vllm.config import VllmConfig
 
+from vllm_factory.optional_deps import require
 from vllm_factory.pooling.vllm_adapter import VllmPoolerAdapter
 
 from .config import GLiNERLinkerConfig
@@ -113,6 +113,10 @@ class GLiNERLinkerModel(nn.Module):
         self.rnn.eval()
 
         # Span representation head used when represent_spans=True.
+        span_rep_mod = require(
+            "gliner.modeling.span_rep", "gliner", purpose="GLiNER linker span representation"
+        )
+        SpanRepLayer = span_rep_mod.SpanRepLayer
         self.span_rep_layer = SpanRepLayer(
             span_mode=getattr(cfg, "span_mode", "token_level"),
             hidden_size=H,

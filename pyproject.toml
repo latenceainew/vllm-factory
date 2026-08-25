@@ -36,6 +36,9 @@ dependencies = [
 gliner = [
     "gliner>=0.2.26",
 ]
+gliner2 = [
+    "gliner2>=2.0.0",
+]
 glinker = [
     "gliner>=0.2.26",
     "glinker>=0.1.0",
@@ -54,6 +57,16 @@ dev = [
     "packaging>=24.0",
 ]
 kernels = [
+    "triton>=2.0",
+]
+all = [
+    "gliner>=0.2.26",
+    "gliner2>=2.0.0",
+    "glinker>=0.1.0",
+    "matplotlib>=3.7",
+    "aiohttp>=3.9",
+    "numpy",
+    "datasets>=2.14",
     "triton>=2.0",
 ]
 

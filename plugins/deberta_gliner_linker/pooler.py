@@ -19,8 +19,8 @@ from typing import List
 
 import torch
 import torch.nn as nn
-from gliner.modeling.utils import extract_spans_from_tokens
 
+from vllm_factory.optional_deps import require
 from vllm_factory.pooling.protocol import PoolerContext, split_hidden_states
 from vllm_factory.pooling.shape_prefix import pack_shape_prefixed_tensor
 
@@ -110,7 +110,10 @@ class GLiNERLinkerPooler(nn.Module):
 
             threshold = float(add.get("threshold", 0.5))
             scores = self._run_scorer(we, le)
-            span_idx, span_mask = extract_spans_from_tokens(
+            gliner_utils = require(
+                "gliner.modeling.utils", "gliner", purpose="GLiNER linker pooling"
+            )
+            span_idx, span_mask = gliner_utils.extract_spans_from_tokens(
                 scores, labels=None, threshold=threshold
             )
             span_rep = self._span_rep_layer(we, span_idx * span_mask.unsqueeze(-1).long())

@@ -18,7 +18,6 @@ import torch
 from torch import nn
 from vllm.config import VllmConfig
 
-from poolers.gliner2 import GLiNER2Pooler
 from vllm_factory.pooling.vllm_adapter import VllmPoolerAdapter
 
 logger = logging.getLogger(__name__)
@@ -110,6 +109,8 @@ class GLiNER2ModernBertModel(nn.Module):
         hidden_size = int(cfg.hidden_size)
         max_width = int(getattr(cfg, "max_width", 12))
         counting_layer = getattr(cfg, "counting_layer", "count_lstm_v2")
+
+        from poolers.gliner2 import GLiNER2Pooler
 
         self._business_pooler = GLiNER2Pooler(
             hidden_size=hidden_size,
@@ -223,6 +224,9 @@ class GLiNER2ModernBertModel(nn.Module):
                 getattr(self.config, "counting_layer", "?"),
             )
         else:
-            logger.warning("[mmBERT-GLiNER2] WARNING: No pooler weights loaded!")
+            raise RuntimeError(
+                "mmBERT-GLiNER2 pooler weights were empty after load_weights. "
+                "Refusing to serve a random-init head."
+            )
 
         return set(name for name, _ in self.named_parameters())

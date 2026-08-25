@@ -9,8 +9,8 @@ from typing import List
 
 import torch
 import torch.nn as nn
-from gliner.modeling.utils import extract_prompt_features_and_word_embeddings
 
+from vllm_factory.optional_deps import require
 from vllm_factory.pooling.protocol import PoolerContext, split_hidden_states
 from vllm_factory.pooling.shape_prefix import pack_shape_prefixed_tensor
 
@@ -93,14 +93,19 @@ class GLiNERRerankPooler(nn.Module):
             tok_b = tok.unsqueeze(0)
             tl = torch.tensor([text_length], device=dev, dtype=torch.long)
 
-            prompts, p_mask, words_pre, w_mask = extract_prompt_features_and_word_embeddings(
-                class_token_index,
-                tok_b,
-                input_ids_b,
-                attn_b,
-                tl,
-                wmask_b,
-                embed_ent_token=embed_ent_token,
+            gliner_utils = require(
+                "gliner.modeling.utils", "gliner", purpose="GLiNER rerank pooling"
+            )
+            prompts, p_mask, words_pre, w_mask = (
+                gliner_utils.extract_prompt_features_and_word_embeddings(
+                    class_token_index,
+                    tok_b,
+                    input_ids_b,
+                    attn_b,
+                    tl,
+                    wmask_b,
+                    embed_ent_token=embed_ent_token,
+                )
             )
 
             words = self._run_lstm(words_pre, w_mask)

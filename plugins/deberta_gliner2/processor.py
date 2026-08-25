@@ -1,8 +1,11 @@
-"""GLiNER2 vLLM Processor — handles preprocessing and postprocessing.
+"""GLiNER2 serving processor: HTTP schema adapter + tokenize/decode.
 
-Ports the SchemaTransformer logic from gliner2.processor for vLLM use.
-Preprocessing: Schema + text → tokenized input with mapped_indices.
-Postprocessing: Raw output tensor → structured extraction results.
+HTTP ``normalize_*`` stays here — ``gliner2`` schema builders do not accept
+the Pioneer request shape or ``_meta`` thresholds. Tokenize/format stays
+local too: ``SchemaTransformer.transform_record`` needs a HuggingFace
+tokenizer (``add_special_tokens``) and wraps classification fields, which
+breaks the DummyTokenizer golden contract. Decode/format/truncation are
+serving-only.
 """
 
 from __future__ import annotations

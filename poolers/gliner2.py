@@ -1,302 +1,24 @@
 # GLiNER2 Pooler — Schema-based multi-task information extraction.
 #
-# Architecture:
-#     SpanRepLayer (markerV0) → CountLSTM (GRU + pos embs) → classifier MLP → count_pred MLP
-#     Produces:
-#       - Span scores: einsum('lkd,bpd->bplk', span_rep, count_embed_out)
-#       - Classification logits: classifier(schema_embs)
-#       - Count logits: count_pred(prompt_emb)
-#
-# Supports 4 task types: entities, json_structures, relations, classifications
-# Uses the same SpanRepLayer from gliner.modeling.span_rep as GLiNER v1
-#
-# Implements FactoryPooler protocol — zero vLLM imports.
+# Head modules come from gliner2.layers (optional extra). This file owns
+# serving: splitting vLLM hidden states, extra_kwargs plumbing, and packing.
 
 from __future__ import annotations
 
-import re
 from collections import OrderedDict
 from typing import Any, Dict, List
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 from vllm_factory.pooling.protocol import PoolerContext, split_hidden_states
 
-# ==================================================================
-# Utility: MLP builder (mirrors gliner2.layers.create_mlp)
-# ==================================================================
 
-def create_mlp(input_dim, intermediate_dims, output_dim,
-               dropout=0.1, activation="gelu", add_layer_norm=False):
-    activation_mapping = {
-        "relu": nn.ReLU, "tanh": nn.Tanh, "sigmoid": nn.Sigmoid,
-        "leaky_relu": nn.LeakyReLU, "gelu": nn.GELU,
-    }
-    layers = []
-    in_dim = input_dim
-    for dim in intermediate_dims:
-        layers.append(nn.Linear(in_dim, dim))
-        if add_layer_norm:
-            layers.append(nn.LayerNorm(dim))
-        layers.append(activation_mapping[activation]())
-        if dropout > 0:
-            layers.append(nn.Dropout(dropout))
-        in_dim = dim
-    layers.append(nn.Linear(in_dim, output_dim))
-    return nn.Sequential(*layers)
+def _gliner2_layers():
+    """Import gliner2.layers; raises with the extra hint if it is missing."""
+    from vllm_factory.optional_deps import require
 
-
-# ==================================================================
-# CountLSTM (mirrors gliner2.layers.CountLSTM)
-# ==================================================================
-
-class CountLSTM(nn.Module):
-    """Count-aware unrolling: GRU + positional embeddings → count copies of schema embeddings."""
-
-    def __init__(self, hidden_size, max_count=20):
-        super().__init__()
-        self.hidden_size = hidden_size
-        self.max_count = max_count
-        self.pos_embedding = nn.Embedding(max_count, hidden_size)
-        self.gru = nn.GRU(input_size=hidden_size, hidden_size=hidden_size)
-        self.projector = create_mlp(
-            input_dim=hidden_size * 2,
-            intermediate_dims=[hidden_size * 4],
-            output_dim=hidden_size,
-            dropout=0., activation="relu", add_layer_norm=False,
-        )
-
-    def forward(self, pc_emb: torch.Tensor, gold_count_val: int) -> torch.Tensor:
-        """pc_emb: (M, D) field embeddings → (count, M, D) count-aware embeddings."""
-        M, D = pc_emb.shape
-        gold_count_val = min(gold_count_val, self.max_count)
-        count_indices = torch.arange(gold_count_val, device=pc_emb.device)
-        pos_seq = self.pos_embedding(count_indices).unsqueeze(1).expand(gold_count_val, M, D)
-        h0 = pc_emb.unsqueeze(0)
-        output, _ = self.gru(pos_seq, h0)
-        return self.projector(torch.cat([output, pc_emb.unsqueeze(0).expand_as(output)], dim=-1))
-
-
-# ==================================================================
-# DownscaledTransformer (mirrors gliner2.layers.DownscaledTransformer)
-# ==================================================================
-
-class DownscaledTransformer(nn.Module):
-    """Bottleneck transformer used as the projector inside ``CountLSTMv2``.
-
-    Projects the GRU output into a small hidden space, runs a two-layer
-    ``nn.TransformerEncoder``, concatenates the transformer output with the
-    original input, and projects back to ``input_size``. State-dict keys
-    match the native ``gliner2.layers.DownscaledTransformer`` exactly so
-    checkpoints produced with ``counting_layer == "count_lstm_v2"`` load
-    without any key remapping.
-    """
-
-    def __init__(self, input_size: int, hidden_size: int,
-                 num_heads: int = 4, num_layers: int = 2, dropout: float = 0.1):
-        super().__init__()
-        self.input_size = input_size
-        self.hidden_size = hidden_size
-        self.num_heads = num_heads
-        self.num_layers = num_layers
-
-        self.in_projector = nn.Linear(input_size, hidden_size)
-
-        encoder = nn.TransformerEncoderLayer(
-            d_model=hidden_size,
-            nhead=num_heads,
-            dim_feedforward=hidden_size * 2,
-            dropout=dropout,
-            batch_first=True,
-        )
-        self.transformer = nn.TransformerEncoder(encoder, num_layers=num_layers)
-
-        self.out_projector = create_mlp(
-            input_dim=hidden_size + input_size,
-            intermediate_dims=[input_size, input_size],
-            output_dim=input_size,
-            dropout=0.,
-            activation="relu",
-            add_layer_norm=False,
-        )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        original_x = x
-        x = self.in_projector(x)
-        x = self.transformer(x)
-        x = torch.cat([x, original_x], dim=-1)
-        x = self.out_projector(x)
-        return x
-
-
-# ==================================================================
-# CountLSTMv2 (mirrors gliner2.layers.CountLSTMv2)
-# ==================================================================
-
-class CountLSTMv2(nn.Module):
-    """Count-aware unrolling with a ``DownscaledTransformer`` projector.
-
-    Drop-in replacement for ``CountLSTM`` used by GLiNER2 checkpoints whose
-    extractor config sets ``counting_layer == "count_lstm_v2"`` (e.g.
-    ``fastino/gliner2-base-v1``). Parameter names match upstream so
-    ``state_dict`` loads without remapping.
-    """
-
-    def __init__(self, hidden_size: int, max_count: int = 20):
-        super().__init__()
-        self.hidden_size = hidden_size
-        self.max_count = max_count
-        self.pos_embedding = nn.Embedding(max_count, hidden_size)
-        self.gru = nn.GRU(input_size=hidden_size, hidden_size=hidden_size)
-        self.transformer = DownscaledTransformer(
-            input_size=hidden_size,
-            hidden_size=128,
-            num_heads=4,
-            num_layers=2,
-            dropout=0.1,
-        )
-
-    def forward(self, pc_emb: torch.Tensor, gold_count_val: int) -> torch.Tensor:
-        M, D = pc_emb.shape
-        gold_count_val = min(gold_count_val, self.max_count)
-        full_idx = torch.arange(self.max_count, device=pc_emb.device)
-        count_idx = full_idx[:gold_count_val]
-        pos_seq = self.pos_embedding(count_idx).unsqueeze(1).expand(-1, M, -1)
-        output, _ = self.gru(pos_seq, pc_emb.unsqueeze(0))
-        pc_broadcast = pc_emb.unsqueeze(0).expand_as(output)
-        return self.transformer(output + pc_broadcast)
-
-
-# ==================================================================
-# CountLSTMoE (mirrors gliner2.layers.CountLSTMoE)
-# ==================================================================
-
-class CountLSTMoE(nn.Module):
-    """Count-aware unrolling with a packed-expert MoE projector.
-
-    Drop-in replacement for ``CountLSTM`` used by GLiNER2 checkpoints whose
-    extractor config sets ``counting_layer == "count_lstm_moe"``. Parameter
-    names (``w1``/``b1``/``w2``/``b2``/``router.*``) match upstream so
-    ``state_dict`` loads without remapping.
-    """
-
-    def __init__(self, hidden_size: int, max_count: int = 20,
-                 n_experts: int = 4, ffn_mult: int = 2, dropout: float = 0.1):
-        super().__init__()
-        self.hidden_size = hidden_size
-        self.max_count = max_count
-        self.n_experts = n_experts
-
-        self.pos_embedding = nn.Embedding(max_count, hidden_size)
-        self.gru = nn.GRU(input_size=hidden_size, hidden_size=hidden_size)
-
-        inner = hidden_size * ffn_mult
-        self.w1 = nn.Parameter(torch.empty(n_experts, hidden_size, inner))
-        self.b1 = nn.Parameter(torch.zeros(n_experts, inner))
-        self.w2 = nn.Parameter(torch.empty(n_experts, inner, hidden_size))
-        self.b2 = nn.Parameter(torch.zeros(n_experts, hidden_size))
-        nn.init.xavier_uniform_(self.w1)
-        nn.init.xavier_uniform_(self.w2)
-
-        self.dropout = nn.Dropout(dropout)
-
-        self.router = nn.Sequential(
-            nn.Linear(hidden_size, hidden_size),
-            nn.GELU(),
-            nn.Linear(hidden_size, n_experts),
-            nn.Softmax(dim=-1),
-        )
-
-    def forward(self, pc_emb: torch.Tensor, gold_count_val: int) -> torch.Tensor:
-        M, D = pc_emb.shape
-        L = min(gold_count_val, self.max_count)
-        idx = torch.arange(L, device=pc_emb.device)
-        pos_seq = self.pos_embedding(idx).unsqueeze(1).expand(L, M, D)
-        h, _ = self.gru(pos_seq, pc_emb.unsqueeze(0))
-        gates = self.router(h)
-        x = torch.einsum("lmd,edh->lmeh", h, self.w1) + self.b1
-        x = F.gelu(x)
-        x = self.dropout(x)
-        x = torch.einsum("lmeh,ehd->lmed", x, self.w2) + self.b2
-        return (gates.unsqueeze(-1) * x).sum(dim=2)
-
-
-# ==================================================================
-# SpanRepLayer (from gliner.modeling.span_rep — reused)
-# ==================================================================
-
-class SpanMarkerV0(nn.Module):
-    """Span marker using start/end projections."""
-
-    def __init__(self, hidden_size, max_width, dropout=0.1):
-        super().__init__()
-        self.max_width = max_width
-        self.hidden_size = hidden_size
-
-        def _proj(h_in, h_out=None):
-            h_out = h_out or h_in
-            return nn.Sequential(
-                nn.Linear(h_in, h_out * 4), nn.ReLU(),
-                nn.Dropout(dropout), nn.Linear(h_out * 4, h_out),
-            )
-
-        self.project_start = _proj(hidden_size)
-        self.project_end = _proj(hidden_size)
-        self.out_project = _proj(hidden_size * 2, hidden_size)
-
-    def forward(self, h: torch.Tensor, span_idx: torch.Tensor) -> torch.Tensor:
-        """h: (B,L,D), span_idx: (B,S,2) → (B,S,D)."""
-        B, L, D = h.shape
-        start_rep = self.project_start(h)
-        end_rep = self.project_end(h)
-        idx_start = span_idx[:, :, 0].clamp(0, L - 1)
-        idx_end = span_idx[:, :, 1].clamp(0, L - 1)
-        start_span = start_rep.gather(1, idx_start.unsqueeze(-1).expand(-1, -1, D))
-        end_span = end_rep.gather(1, idx_end.unsqueeze(-1).expand(-1, -1, D))
-        cat = torch.cat([start_span, end_span], dim=-1).relu()
-        return self.out_project(cat)
-
-
-class SpanRepLayer(nn.Module):
-    """Wraps SpanMarkerV0 with the same interface as gliner.modeling.span_rep.SpanRepLayer."""
-
-    def __init__(self, span_mode="markerV0", hidden_size=768, max_width=8, dropout=0.1):
-        super().__init__()
-        self.span_rep_layer = SpanMarkerV0(hidden_size, max_width, dropout)
-
-    def forward(self, x: torch.Tensor, span_idx: torch.Tensor) -> torch.Tensor:
-        return self.span_rep_layer(x, span_idx)
-
-
-# ==================================================================
-# Text Splitter (same as gliner2.processor.WhitespaceTokenSplitter)
-# ==================================================================
-
-WORD_PATTERN = re.compile(
-    r"""(?:https?://[^\s]+|www\.[^\s]+)
-    |[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}
-    |@[a-z0-9_]+
-    |\w+(?:[-_]\w+)*
-    |\S""",
-    re.VERBOSE | re.IGNORECASE,
-)
-
-
-def split_words(text: str, lower: bool = True):
-    """Split text into (word, start, end) tuples."""
-    if lower:
-        text_lower = text.lower()
-    else:
-        text_lower = text
-    return [(m.group(), m.start(), m.end()) for m in WORD_PATTERN.finditer(text_lower)]
-
-
-def split_words_with_original(text: str):
-    """Split lowercased but return original-case char positions."""
-    text_lower = text.lower()
-    return [(m.group(), m.start(), m.end()) for m in WORD_PATTERN.finditer(text_lower)]
+    return require("gliner2.layers", "gliner2", purpose="GLiNER2 pooling")
 
 
 # ==================================================================
@@ -309,44 +31,33 @@ class GLiNER2Pooler(nn.Module):
     This handles the head computation (everything after the encoder backbone).
     """
 
+
     def __init__(self, hidden_size: int, max_width: int = 8,
                  counting_layer: str = "count_lstm"):
         super().__init__()
+        layers = _gliner2_layers()
         self.hidden_size = hidden_size
         self.max_width = max_width
         self.counting_layer = counting_layer
 
-        # Span representation
-        self.span_rep = SpanRepLayer(
-            span_mode="markerV0", hidden_size=hidden_size,
-            max_width=max_width, dropout=0.1,
+        # gliner2.layers.SpanRepLayer(hidden_size, max_width, span_mode, **kwargs)
+        self.span_rep = layers.SpanRepLayer(
+            hidden_size, max_width, "markerV0", dropout=0.1,
         )
-
-        # Classifier for classification tasks
-        self.classifier = create_mlp(
+        self.classifier = layers.create_mlp(
             input_dim=hidden_size, intermediate_dims=[hidden_size * 2],
             output_dim=1, dropout=0., activation="relu", add_layer_norm=False,
         )
-
-        # Count prediction (0-19)
-        self.count_pred = create_mlp(
+        self.count_pred = layers.create_mlp(
             input_dim=hidden_size, intermediate_dims=[hidden_size * 2],
             output_dim=20, dropout=0., activation="relu", add_layer_norm=False,
         )
-
-        # Count embedding — mirror gliner2/model.py so every checkpoint
-        # variant produced by the native repo (count_lstm / count_lstm_v2 /
-        # count_lstm_moe) loads into a pooler whose state_dict keys match
-        # exactly. Silently defaulting to CountLSTM regardless of config
-        # value would let non-count_lstm checkpoints load with a mostly
-        # random-init count_embed (load_state_dict strict=False drops the
-        # mismatched keys) and produce semantically-wrong output.
         if counting_layer == "count_lstm":
-            self.count_embed = CountLSTM(hidden_size)
+            self.count_embed = layers.CountLSTM(hidden_size)
         elif counting_layer == "count_lstm_v2":
-            self.count_embed = CountLSTMv2(hidden_size=hidden_size)
+            self.count_embed = layers.CountLSTMv2(hidden_size=hidden_size)
         elif counting_layer == "count_lstm_moe":
-            self.count_embed = CountLSTMoE(hidden_size=hidden_size)
+            self.count_embed = layers.CountLSTMoE(hidden_size=hidden_size)
         else:
             raise ValueError(
                 f"Unsupported counting_layer {counting_layer!r}; expected one of "
@@ -376,12 +87,12 @@ class GLiNER2Pooler(nn.Module):
 
         spans_idx = torch.tensor([spans_idx], dtype=torch.long, device=device)
 
-        span_rep = self.span_rep(
-            token_embs.unsqueeze(0), spans_idx,
-        ).squeeze(0)  # (L*K, D)
-
-        # Reshape to (L, K, D) for einsum('lkd,bpd->bplk')
-        span_rep = span_rep.view(text_length, self.max_width, -1)
+        span_rep = self.span_rep(token_embs.unsqueeze(0), spans_idx)
+        # Native gliner2 returns (B, L, K, D); the deleted port returned (B, L*K, D).
+        if span_rep.dim() == 4:
+            span_rep = span_rep.squeeze(0)
+        else:
+            span_rep = span_rep.squeeze(0).view(text_length, self.max_width, -1)
 
         return {"span_rep": span_rep}
 

@@ -130,6 +130,17 @@ def prepare_model_for_vllm_if_needed(
     )
     hf_config = _read_json(config_json_path) if config_json_path else {}
 
+    architecture = hf_config.get("architecture")
+    architectures = hf_config.get("architectures") or []
+    is_boundary = architecture == "boundary" or "BoundaryExtractor" in architectures
+    if is_boundary:
+        raise RuntimeError(
+            f"'{model_ref}' is a boundary-architecture GLiNER2 checkpoint "
+            "(architecture=boundary). The deberta_gliner2 span plugin cannot "
+            "serve it — it would load a random-init span head. Use the "
+            "deberta_gliner25 plugin."
+        )
+
     if hf_config.get("model_type") == "extractor" and "encoder_config/config.json" in repo_files:
         enc_cfg_path = _download_file(model_ref, "encoder_config/config.json")
         enc_cfg = _read_json(enc_cfg_path) if enc_cfg_path else {}
