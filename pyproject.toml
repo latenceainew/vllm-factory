@@ -36,6 +36,9 @@ dependencies = [
 gliner = [
     "gliner>=0.2.26",
 ]
+gliner2 = [
+    "gliner2>=2.0.0",
+]
 glinker = [
     "gliner>=0.2.26",
     "glinker>=0.1.0",
@@ -56,6 +59,16 @@ dev = [
 kernels = [
     "triton>=2.0",
 ]
+all = [
+    "gliner>=0.2.26",
+    "gliner2>=2.0.0",
+    "glinker>=0.1.0",
+    "matplotlib>=3.7",
+    "aiohttp>=3.9",
+    "numpy",
+    "datasets>=2.14",
+    "triton>=2.0",
+]
 
 [project.scripts]
 vllm-factory-prep = "forge.__main__:main"
@@ -67,6 +80,7 @@ mt5_gliner = "plugins.mt5_gliner:register"
 mmbert_gliner = "plugins.mmbert_gliner:register"
 deberta_gliner = "plugins.deberta_gliner:register"
 deberta_gliner2 = "plugins.deberta_gliner2:register"
+deberta_gliner25 = "plugins.deberta_gliner25:register"
 mmbert_gliner2 = "plugins.mmbert_gliner2:register"
 deberta_gliner_linker = "plugins.deberta_gliner_linker:register"
 modernbert_gliner_rerank = "plugins.modernbert_gliner_rerank:register"
@@ -83,6 +97,7 @@ colqwen3_io = "plugins.colqwen3.io_processor:get_processor_cls"
 deberta_gliner_io = "plugins.deberta_gliner.io_processor:get_processor_cls"
 mt5_gliner_io = "plugins.mt5_gliner.io_processor:get_processor_cls"
 deberta_gliner2_io = "plugins.deberta_gliner2.io_processor:get_processor_cls"
+deberta_gliner25_io = "plugins.deberta_gliner25.io_processor:get_processor_cls"
 mmbert_gliner2_io = "plugins.mmbert_gliner2.io_processor:get_processor_cls"
 moderncolbert_io = "plugins.moderncolbert.io_processor:get_processor_cls"
 collfm2_io = "plugins.collfm2.io_processor:get_processor_cls"

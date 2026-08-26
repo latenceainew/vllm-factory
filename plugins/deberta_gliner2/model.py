@@ -18,7 +18,6 @@ from transformers import DebertaV2Config
 from vllm.config import VllmConfig
 from vllm.model_executor.models.interfaces import SupportsLoRA
 
-from poolers.gliner2 import GLiNER2Pooler
 from vllm_factory.pooling.vllm_adapter import VllmPoolerAdapter
 
 from .config import GLiNER2Config
@@ -102,6 +101,9 @@ class GLiNER2VLLMModel(nn.Module, SupportsLoRA):
         self.encoder = DebertaV2EncoderModel(config=encoder_cfg)
 
         # 2. GLiNER2 head (span_rep + count_embed + classifier + count_pred)
+        # Imported here so register() stays import-safe without the gliner2 extra.
+        from poolers.gliner2 import GLiNER2Pooler
+
         self._business_pooler = GLiNER2Pooler(
             hidden_size=cfg.encoder_hidden_size,
             max_width=cfg.max_width,
@@ -226,6 +228,10 @@ class GLiNER2VLLMModel(nn.Module, SupportsLoRA):
                 getattr(self.config, "counting_layer", "?"),
             )
         else:
-            logger.warning("[GLiNER2] WARNING: No pooler weights loaded!")
+            raise RuntimeError(
+                "GLiNER2 pooler weights were empty after load_weights. "
+                "A boundary checkpoint prepared as a span model produces a "
+                "random-init head; refusing to serve it."
+            )
 
         return set(name for name, _ in self.named_parameters())

@@ -53,6 +53,11 @@ PLUGIN_REGISTRY = {
         "architectures": ["GLiNER2VLLMModel"],
         "extra_fields": {},
     },
+    "deberta_gliner25": {
+        "model_type": "gliner25",
+        "architectures": ["GLiNER25VLLMModel"],
+        "extra_fields": {},
+    },
     "deberta_gliner_linker": {
         "model_type": "gliner_linker",
         "architectures": ["GLiNERLinkerModel"],
@@ -129,6 +134,16 @@ def prepare_model_for_vllm_if_needed(
         _download_file(model_ref, "config.json") if "config.json" in repo_files else None
     )
     hf_config = _read_json(config_json_path) if config_json_path else {}
+
+    architecture = hf_config.get("architecture")
+    architectures = hf_config.get("architectures") or []
+    is_boundary = architecture == "boundary" or "BoundaryExtractor" in architectures
+    if is_boundary or plugin == "deberta_gliner25":
+        return prepare_gliner25_model(
+            hf_model_id=model_ref,
+            output_dir=output_dir,
+            force=force,
+        )
 
     if hf_config.get("model_type") == "extractor" and "encoder_config/config.json" in repo_files:
         enc_cfg_path = _download_file(model_ref, "encoder_config/config.json")
@@ -274,6 +289,100 @@ def prepare_gliner2_model(
 
     logger.info("Model prepared at %s", output_dir)
     logger.info("Config: gliner2, GLiNER2VLLMModel")
+    logger.info(
+        "hidden=%s, encoder_layers=%s",
+        vllm_config["encoder_hidden_size"],
+        vllm_config["encoder_num_hidden_layers"],
+    )
+    return output_dir
+
+
+def prepare_gliner25_model(
+    hf_model_id: str,
+    output_dir: str | None = None,
+    force: bool = False,
+) -> str:
+    """Prepare a boundary GLiNER 2.5 extractor repo for deberta_gliner25."""
+    from transformers import AutoTokenizer
+
+    if output_dir is None:
+        slug = hf_model_id.replace("/", "--")
+        output_dir = f"/tmp/{slug}-vllm"
+
+    config_path = os.path.join(output_dir, "config.json")
+    if os.path.exists(config_path) and not force:
+        cached = _read_json(config_path)
+        if cached.get("model_type") == "gliner25":
+            logger.info("Model already prepared at %s", output_dir)
+            return output_dir
+        shutil.rmtree(output_dir, ignore_errors=True)
+
+    logger.info("Preparing %s for vLLM (deberta_gliner25)...", hf_model_id)
+
+    repo_files = list_repo_files(hf_model_id)
+    extractor_cfg = _read_json(
+        _require_download(hf_model_id, "config.json", "GLiNER25 extractor config")
+    )
+    encoder_cfg = _read_json(
+        _require_download(hf_model_id, "encoder_config/config.json", "GLiNER25 encoder config")
+    )
+
+    os.makedirs(output_dir, exist_ok=True)
+
+    try:
+        tokenizer = AutoTokenizer.from_pretrained(hf_model_id, trust_remote_code=True)
+    except Exception as exc:
+        raise RuntimeError(f"Could not load tokenizer for '{hf_model_id}'") from exc
+    tokenizer.save_pretrained(output_dir)
+
+    vllm_config = {
+        "model_type": "gliner25",
+        "architectures": ["GLiNER25VLLMModel"],
+        "num_hidden_layers": 0,
+        "num_attention_heads": 1,
+        "hidden_size": encoder_cfg.get("hidden_size", 768),
+        "encoder_model_name": extractor_cfg.get("model_name", "microsoft/mdeberta-v3-base"),
+        "vocab_size": len(tokenizer),
+        "encoder_hidden_size": encoder_cfg.get("hidden_size", 768),
+        "encoder_num_hidden_layers": encoder_cfg.get("num_hidden_layers", 12),
+        "encoder_num_attention_heads": encoder_cfg.get("num_attention_heads", 12),
+        "encoder_intermediate_size": encoder_cfg.get("intermediate_size", 3072),
+        "encoder_hidden_act": encoder_cfg.get("hidden_act", "gelu"),
+        "encoder_hidden_dropout_prob": 0.0,
+        "encoder_attention_probs_dropout_prob": 0.0,
+        "encoder_max_position_embeddings": encoder_cfg.get("max_position_embeddings", 512),
+        "encoder_type_vocab_size": encoder_cfg.get("type_vocab_size", 0),
+        "encoder_layer_norm_eps": encoder_cfg.get("layer_norm_eps", 1e-7),
+        "encoder_relative_attention": encoder_cfg.get("relative_attention", True),
+        "encoder_max_relative_positions": encoder_cfg.get("max_relative_positions", -1),
+        "encoder_position_buckets": encoder_cfg.get("position_buckets", 256),
+        "encoder_pos_att_type": encoder_cfg.get("pos_att_type", ["p2c", "c2p"]),
+        "encoder_share_att_key": encoder_cfg.get("share_att_key", True),
+        "encoder_norm_rel_ebd": encoder_cfg.get("norm_rel_ebd", "layer_norm"),
+        "encoder_position_biased_input": encoder_cfg.get("position_biased_input", False),
+        "encoder_pad_token_id": encoder_cfg.get("pad_token_id", 0),
+        "token_pooling": extractor_cfg.get("token_pooling", "first"),
+        "boundary_head": extractor_cfg.get("boundary_head") or {},
+    }
+
+    with open(config_path, "w") as f:
+        json.dump(vllm_config, f, indent=2)
+
+    weight_files = [f for f in repo_files if f.endswith((".safetensors", ".bin", ".pt"))]
+    if not weight_files:
+        raise RuntimeError(f"No model weights found for '{hf_model_id}'")
+    for wf in weight_files:
+        src = _require_download(hf_model_id, wf, "GLiNER25 weight file")
+        dst = os.path.join(output_dir, wf)
+        if not os.path.exists(dst):
+            try:
+                os.symlink(src, dst)
+            except OSError:
+                logger.info("Symlink failed for %s; copying instead", wf)
+                shutil.copy2(src, dst)
+
+    logger.info("Model prepared at %s", output_dir)
+    logger.info("Config: gliner25, GLiNER25VLLMModel")
     logger.info(
         "hidden=%s, encoder_layers=%s",
         vllm_config["encoder_hidden_size"],

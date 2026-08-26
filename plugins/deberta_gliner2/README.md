@@ -185,7 +185,7 @@ from plugins.deberta_gliner2.lora import build_lora_requests
 
 registry = {
     "sql-lora": (1, "/adapters/sql-lora"),
-    "finance":  (2, "/adapters/finance"),
+    "finance": (2, "/adapters/finance"),
 }
 
 parsed = [DeBERTaGLiNER2IOProcessor.factory_parse.__func__(..., data) for data in batch]

@@ -1,0 +1,55 @@
+{
+  "classifications": {},
+  "entities": [
+    {
+      "email": [
+        {
+          "confidence": 0.99609375,
+          "end": 101,
+          "start": 80,
+          "text": "john.smith@nvidia.com"
+        }
+      ],
+      "location": [
+        {
+          "confidence": 0.98828125,
+          "end": 53,
+          "start": 42,
+          "text": "Santa Clara"
+        },
+        {
+          "confidence": 0.5,
+          "end": 65,
+          "start": 55,
+          "text": "California"
+        }
+      ],
+      "organization": [
+        {
+          "confidence": 1.0,
+          "end": 38,
+          "start": 20,
+          "text": "NVIDIA Corporation"
+        }
+      ],
+      "person": [
+        {
+          "confidence": 1.0,
+          "end": 10,
+          "start": 0,
+          "text": "John Smith"
+        }
+      ],
+      "phone_number": [
+        {
+          "confidence": 0.99609375,
+          "end": 134,
+          "start": 122,
+          "text": "555-123-4567"
+        }
+      ]
+    }
+  ],
+  "relations": {},
+  "structures": {}
+}

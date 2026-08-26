@@ -53,7 +53,7 @@ def extractor_repo():
 
 
 def _route_called(monkeypatch):
-    """Replace both prepare functions with recorders; return the record."""
+    """Replace prepare functions with recorders; return the record."""
     calls = {}
 
     def _recorder(name, result):
@@ -70,6 +70,11 @@ def _route_called(monkeypatch):
         model_prep,
         "prepare_mmbert_gliner2_model",
         _recorder("mmbert_gliner2", "/prepared/mmbert"),
+    )
+    monkeypatch.setattr(
+        model_prep,
+        "prepare_gliner25_model",
+        _recorder("deberta_gliner25", "/prepared/boundary"),
     )
     return calls
 
@@ -121,3 +126,24 @@ def test_non_gliner_repo_passes_through(monkeypatch, tmp_path):
     result = model_prep.prepare_model_for_vllm_if_needed("bert-base-uncased/x")
 
     assert result == "bert-base-uncased/x"
+
+
+def test_boundary_architecture_routes_to_gliner25_prepare(
+    monkeypatch, tmp_path, extractor_repo
+):
+    """A boundary checkpoint must be prepared by deberta_gliner25, not span."""
+    extractor_repo["configs"]["config.json"] = {
+        "model_type": "extractor",
+        "architecture": "boundary",
+        "architectures": ["BoundaryExtractor"],
+        "model_name": "microsoft/mdeberta-v3-base",
+    }
+    extractor_repo["configs"]["encoder_config/config.json"] = {"model_type": "deberta-v2"}
+    _fake_hub(monkeypatch, tmp_path, extractor_repo["repo_files"], extractor_repo["configs"])
+    calls = _route_called(monkeypatch)
+
+    result = model_prep.prepare_model_for_vllm_if_needed("fastino/gliner2.5-multi-v1")
+
+    assert result == "/prepared/boundary"
+    assert "deberta_gliner25" in calls
+    assert "deberta_gliner2" not in calls

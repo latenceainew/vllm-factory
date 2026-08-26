@@ -794,12 +794,24 @@ class DebertaV2Encoder(nn.Module):
             return relative_pos
         return None
 
+    def uses_flash_path(self) -> bool:
+        """Report whether the layers will take the fused Triton attention path.
+
+        Returns:
+            True when every layer's attention will consume ``rel_embeddings``
+            through the fused kernel, which ignores ``relative_pos``.
+        """
+        first = self.layer[0].attention.self_attn if self.layer else None
+        return bool(first is not None and first.use_flash_kernel and first.relative_attention)
+
     def forward(self, hidden_states, attention_mask, input_mask=None):
         attention_mask = self.get_attention_mask(attention_mask)
-        relative_pos = self.get_rel_pos(hidden_states)
+        # The fused kernel derives positions internally, so building the
+        # (1, L, L) index tensor here would be discarded work.
+        relative_pos = None if self.uses_flash_path() else self.get_rel_pos(hidden_states)
         rel_embeddings = self.get_rel_embedding()
 
-        all_hidden_states = [hidden_states]
+        prev_hidden_states = hidden_states
 
         for i, layer_module in enumerate(self.layer):
             hidden_states = layer_module(
@@ -809,8 +821,8 @@ class DebertaV2Encoder(nn.Module):
             )
             # ConvLayer after first layer
             if i == 0 and self.conv is not None and input_mask is not None:
-                hidden_states = self.conv(hidden_states, all_hidden_states[-1], input_mask)
-            all_hidden_states.append(hidden_states)
+                hidden_states = self.conv(hidden_states, prev_hidden_states, input_mask)
+            prev_hidden_states = hidden_states
 
         return hidden_states
 

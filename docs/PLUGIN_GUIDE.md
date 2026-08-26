@@ -298,6 +298,23 @@ PyTorch implementation.
 
 ---
 
+## Optional extras (`gliner` / `gliner2`)
+
+`vllm-factory` installs and **registers** without those packages. vLLM calls
+every `vllm.general_plugins` `register()` at engine start, so:
+
+- No `import gliner` / `import gliner2` at module scope on a plugin's
+  registration path (`__init__.py` → `config.py` / `model.py`).
+- Import those libraries inside `__init__` / method bodies via
+  `vllm_factory.optional_deps.require(module, extra, purpose=...)`.
+- `pip install vllm-factory[gliner2]` pulls `gliner2>=2.0.0`;
+  `vllm-factory[all]` unions every extra.
+
+`tests/test_plugin_registration_without_extras.py` blocks `gliner`/`gliner2`
+with a `sys.meta_path` finder and asserts every `register()` still succeeds.
+
+---
+
 ## Common Gotchas
 
 | Issue | Solution |
